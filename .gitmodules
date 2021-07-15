@@ -1,0 +1,12 @@
+[submodule "ips2ra"]
+	path = ips2ra
+	url = https://github.com/ips4o/ips2ra
+[submodule "DySECT"]
+	path = DySECT
+	url = https://github.com/TooBiased/DySECT.git
+[submodule "pcg-cpp"]
+	path = pcg-cpp
+	url = https://github.com/imneme/pcg-cpp.git
+[submodule "tlx"]
+	path = tlx
+	url = https://github.com/tlx/tlx.git
