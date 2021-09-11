@@ -1,6 +1,6 @@
 ## BuRR: Bumped Ribbon Retrieval (and Filters)
 
-BuRR is a static retrieval and approximate membership query data structure with extremely low overhead and fast queries.
+BuRR is a static retrieval and approximate membership query data structure with extremely low overhead and fast queries. You can read the [preprint on arxiv.org](https://arxiv.org/abs/2109.01892).
 
 "Retrieval" means that you have a set of key-value pairs that you want to represent very compactly.  The difference to a hash table is that the data structure may return garbage values when queried with keys not in the set.  It's also typically far more compact: a BuRR representation of the data is typically not more than 0.1-0.5% larger than the *values* it represents (no keys are stored).
 
@@ -15,12 +15,14 @@ Make sure to fetch all submodules with `git submodule update --init --recursive`
 If you use BuRR in the context of an academic publication, we ask that you please cite our paper:
 
 ```bibtex
-@inproceedings{BuRR2021,
+@article{BuRR2021,
     author={Peter C. Dillinger, Lorenz Hübschle-Schneider, Peter Sanders, and Stefan Walzer},
-    title={Engineering Bumped Ribbon Retrieval ({BuRR}) -- Fast Succinct Retrieval and Approximate Membership},
+    title={Fast Succinct Retrieval and Approximate Membership using Ribbon},
     year={2021},
-    booktitle={TODO, as of yet unpublished},
-    doi={TODO},
+    eprinttype = {arXiv},
+    eprint={2109.01892},
+    journal={CoRR},
+    volume={abs/2106.12270},
 }
 ```
 
