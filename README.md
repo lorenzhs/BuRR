@@ -1,6 +1,6 @@
 ## BuRR: Bumped Ribbon Retrieval (and Filters)
 
-BuRR is a static retrieval and approximate membership query data structure with extremely low overhead and fast queries. You can read the [preprint on arxiv.org](https://arxiv.org/abs/2109.01892).
+BuRR is a static retrieval and approximate membership query data structure with extremely low overhead and fast queries. Our paper introducing BuRR, ["Fast Succinct Retrieval and Approximate Membership Using Ribbon"](https://drops.dagstuhl.de/opus/volltexte/2022/16538/), won the best paper award at the 20th International Symposium on Experimental Algorithms 2022 and is available in full as an open-access publication. For additional details and measurements, please [refer to the preprint on arxiv.org](https://arxiv.org/abs/2109.01892).
 
 "Retrieval" means that you have a set of key-value pairs that you want to represent very compactly.  The difference to a hash table is that the data structure may return garbage values when queried with keys not in the set.  It's also typically far more compact: a BuRR representation of the data is typically not more than 0.1-0.5% larger than the *values* it represents (no keys are stored).
 
@@ -15,14 +15,13 @@ Make sure to fetch all submodules with `git submodule update --init --recursive`
 If you use BuRR in the context of an academic publication, we ask that you please cite our paper:
 
 ```bibtex
-@article{BuRR2021,
+@inproceedings{BuRR2022,
     author={Peter C. Dillinger, Lorenz Hübschle-Schneider, Peter Sanders, and Stefan Walzer},
     title={Fast Succinct Retrieval and Approximate Membership using Ribbon},
-    year={2021},
-    eprinttype = {arXiv},
-    eprint={2109.01892},
-    journal={CoRR},
-    volume={abs/2106.12270},
+    booktitle={20th International Symposium on Experimental Algorithms (SEA 2022)},
+    pages={4:1--4:20},
+    year={2022},
+    doi={10.4230/LIPIcs.SEA.2022.4}
 }
 ```
 
