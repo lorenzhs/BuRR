@@ -1,6 +1,12 @@
 INCLUDES = -Itlx -isystem ips2ra/include -IDySECT
-CFLAGS = -std=c++17 -Wall -Wextra -pedantic -Werror $(INCLUDES)
-LDFLAGS = sorter.o tlx/build/tlx/libtlx.a -lpthread
+#CFLAGS = -std=c++17 -Wall -Wextra -pedantic -Werror $(INCLUDES)
+# _REENTRANT or _OPENMP is needed for ips2ra to allow
+# parallel sorting
+# FIXME: decide whether to use OpenMP or not
+# FIXME: for some reason, the parallel version of ips2ra segfaults when
+# I don't use OpenMP...
+CFLAGS = -std=c++17 -Wall -Wextra -pedantic -D_REENTRANT $(INCLUDES) -fopenmp
+LDFLAGS = sorter.o tlx/build/tlx/libtlx.a -lpthread -ltbb -latomic -fopenmp
 BITS = -DRIBBON_BITS=$(RIBBON_BITS)
 
 OPTFLAGS = -O3 -DNDEBUG -march=native

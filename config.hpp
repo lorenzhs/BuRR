@@ -257,9 +257,10 @@ struct RConfig
     static constexpr Index kBucketSize =
         bucket_sh < 0 ? (recommended_bucket_size<coeff_bits, mode> >> -bucket_sh)
                       : (recommended_bucket_size<coeff_bits, mode> << bucket_sh);
+    /* FIXME: change kUseMHC to true again after the parallel version of that is implemented */
     static constexpr bool kSparseCoeffs = sparse,
                           kUseInterleavedSol = interleaved,
-                          kUseCacheLineStorage = cls, kUseMHC = true;
+                          kUseCacheLineStorage = cls, kUseMHC = false;
 };
 
 /******************************************************************************/

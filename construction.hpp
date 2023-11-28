@@ -17,6 +17,8 @@
 // Use in-place super-scalar radix sorter ips2ra, which is around 3x faster for
 // the inputs used here
 #include <ips2ra.hpp>
+#else
+#include <execution>
 #endif
 
 #include <algorithm>
@@ -24,6 +26,8 @@
 #include <functional>
 #include <tuple>
 #include <vector>
+#include <mutex>
+#include <thread>
 
 namespace ribbon {
 
@@ -84,6 +88,18 @@ __attribute__((noinline)) void my_sort(Iterator begin, Iterator end) {
     });
 #else
     ips2ra::sort(begin, end, [](const auto &x) { return std::get<0>(x); });
+#endif
+}
+
+template <typename Iterator>
+__attribute__((noinline)) void my_sort_parallel(Iterator begin, Iterator end) {
+#ifdef RIBBON_USE_STD_SORT
+    // Use std::sort as a slow fallback
+    std::sort(std::execution::par_unseq, begin, end, [](const auto &a, const auto &b) {
+        return std::get<0>(a) < std::get<0>(b);
+    });
+#else
+    ips2ra::parallel::sort(begin, end, [](const auto &x) { return std::get<0>(x); });
 #endif
 }
 
@@ -320,6 +336,353 @@ bool BandingAddRange(BandingStorage *bs, Hasher &hasher, Iterator begin,
     // set final threshold
     if (thresh == Hasher::NoBumpThresh()) {
         bs->SetMeta(last_bucket, thresh);
+    }
+
+    // migrate thresholds to hash table
+    if constexpr (oneBitThresh) {
+        hasher.Finalise(num_buckets);
+    }
+
+    LOGC(log) << "\tActual insertion took " << timer.ElapsedNanos(true) / 1e6
+              << "ms";
+    return true;
+}
+
+template <typename BandingStorage, typename Hasher, typename Iterator,
+          typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
+bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
+                     Iterator end, BumpStorage *bump_vec, std::size_t num_threads) {
+    using CoeffRow = typename BandingStorage::CoeffRow;
+    using Index = typename BandingStorage::Index;
+    using ResultRow = typename BandingStorage::ResultRow;
+    using Hash = typename Hasher::Hash;
+    constexpr bool kFCA1 = Hasher::kFirstCoeffAlwaysOne;
+    constexpr bool oneBitThresh = Hasher::kThreshMode == ThreshMode::onebit;
+
+    constexpr bool debug = false;
+    constexpr bool log = Hasher::log;
+
+    if (begin == end)
+        return true;
+
+    rocksdb::StopWatchNano timer(true);
+    const Index num_starts = bs->GetNumStarts();
+    const Index num_buckets = bs->GetNumBuckets();
+
+    std::size_t buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
+    /* FIXME: test what value is best here (2 is minimum for parallel version to work) */
+    if (buckets_per_thread < 2)
+        return BandingAddRange(bs, hasher, begin, end, bump_vec);
+
+    sLOG << "Constructing ribbon with" << num_buckets
+         << "buckets,  num_starts = " << num_starts;
+
+    const auto num_items = end - begin; // std::distance(begin, end);
+#ifdef RIBBON_PASS_HASH
+    constexpr bool sparse = Hasher::kSparseCoeffs && Hasher::kCoeffBits < 128;
+    auto input = std::make_unique<
+        std::tuple<Index, Index, std::conditional_t<sparse, uint32_t, Hash>>[]>(
+        num_items);
+#else
+    auto input = std::make_unique<std::pair<Index, Index>[]>(num_items);
+#endif
+
+    {
+        sLOG << "Processing" << num_items << "items";
+
+        std::size_t items_per_thread = (num_items + num_threads - 1) / num_threads;
+        std::vector<std::thread> threads;
+        threads.reserve(num_threads);
+        for (std::size_t ti = 0; ti < num_threads; ++ti) {
+            threads.emplace_back([&, ti]() {
+                Index start_idx = static_cast<Index>(ti * items_per_thread);
+                Index end_idx = static_cast<Index>(std::min((ti + 1) * items_per_thread, static_cast<std::size_t>(num_items)));
+                for (Index i = start_idx; i < end_idx; ++i) {
+                    const Hash h = hasher.GetHash(*(begin + i));
+                    const Index start = hasher.GetStart(h, num_starts);
+                    const Index sortpos = Hasher::StartToSort(start);
+#ifdef RIBBON_PASS_HASH
+                    if constexpr (sparse) {
+                        uint32_t compact_hash = hasher.GetCompactHash(h);
+                        input[i] = std::make_tuple(sortpos, i, compact_hash);
+                    } else {
+                        input[i] = std::make_tuple(sortpos, i, h);
+                    }
+#else
+                    input[i] = std::make_pair(sortpos, i);
+#endif
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+    }
+    LOGC(log) << "\tInput transformation took "
+              << timer.ElapsedNanos(true) / 1e6 << "ms";
+    /* FIXME: this doesn't take num_threads into account */
+    my_sort_parallel(input.get(), input.get() + num_items);
+    LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
+
+    const auto do_bump = [&](auto &thread_bump_vec, auto &vec) {
+        sLOG << "Bumping" << vec.size() << "items";
+        for (auto [row, idx] : vec) {
+            sLOG << "\tBumping row" << row << "item"
+                 << tlx::wrap_unprintable(*(begin + idx));
+            bs->SetCoeffs(row, 0);
+            bs->SetResult(row, 0);
+            thread_bump_vec.push_back(*(begin + idx));
+        }
+        vec.clear();
+    };
+
+    /* FIXME: use sensible reserve() for bump_vec since more items
+       are being bumped now */
+    /* FIXME: all coeffs in bandingstorage are initially 0, so
+       we don't need to use SetCoeffs when bumping these buckets, right? */
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    /* FIXME: this is probably not needed, see comment above
+      bump_vec == nullptr */
+    std::vector<char> thread_ret(num_threads);
+    /* FIXME: sensible reserve() for these */
+    std::vector<BumpStorage> thread_bump_vecs(num_threads);
+    /* FIXME: make hasher.Set and bs->SetMeta concurrent to remove these mutexes */
+    [[maybe_unused]] std::conditional_t<oneBitThresh, std::mutex, int> hash_mtx;
+    std::mutex meta_mtx;
+    for (std::size_t ti = 0; ti < num_threads; ++ti) {
+        threads.emplace_back([&, ti]() {
+            Index start_bucket = ti * buckets_per_thread;
+            /* last bucket has been bumped (except for last thread) */
+            Index end_bucket = ti == num_threads - 1 ?
+                               num_buckets - 1 :
+                               start_bucket + buckets_per_thread - 2;
+            auto start_it = std::lower_bound(
+                input.get(), input.get() + num_items, start_bucket, [](const auto& e, auto v) {
+                return Hasher::GetBucket(std::get<0>(e)) < v;
+            });
+            auto end_it = std::upper_bound(
+                input.get(), input.get() + num_items, end_bucket, [](auto v, const auto& e) {
+                return v < Hasher::GetBucket(std::get<0>(e));
+            });
+            if (start_it == input.get() + num_items) {
+                thread_ret[ti] = 1;
+                return;
+            }
+            Index start_index = start_it - input.get();
+            Index end_index = end_it - input.get();
+
+            /* bump all items in last bucket of range */
+            if (ti != num_threads - 1) {
+                Index bucket = end_bucket + 1;
+                /* FIXME: it might be better to just have a function AllBumpThresh()
+                   (like NoBumpThresh()) to get the proper threshold */
+                if (end_index < num_items) {
+                    Index val = Hasher::GetIntraBucket(std::get<0>(input[end_index]));
+                    Index cval = hasher.Compress(val);
+                    if constexpr (oneBitThresh) {
+                        if (cval == 2) {
+                            {
+                                std::scoped_lock lock(hash_mtx);
+                                hasher.Set(bucket, val);
+                            }
+                            {
+                                std::scoped_lock lock(meta_mtx);
+                                bs->SetMeta(bucket, 0);
+                            }
+                        } else {
+                            std::scoped_lock lock(meta_mtx);
+                            bs->SetMeta(bucket, cval);
+                        }
+                    } else {
+                        std::scoped_lock lock(meta_mtx);
+                        bs->SetMeta(bucket, cval);
+                    }
+                }
+                for (Index i = end_index; i < static_cast<Index>(num_items); ++i) {
+                    if (bucket != Hasher::GetBucket(std::get<0>(input[i])))
+                        break;
+                    thread_bump_vecs[ti].push_back(*(begin + std::get<1>(input[i])));
+                }
+            }
+
+            Index last_bucket = start_bucket;
+            bool all_good = true;
+            Index thresh = Hasher::NoBumpThresh();
+            // Bump cache (row, input item) pairs that may have to be bumped retroactively
+            Index last_cval = -1;
+            std::vector<std::pair<Index, Index>> bump_cache;
+            // For 1-bit thresholds, we also need an uncompressed bump cache for undoing
+            // all insertions with the same uncompressed value if we end up in the
+            // "plus" case with a separately stored threshold
+            [[maybe_unused]] Index last_val = -1;
+            [[maybe_unused]] std::conditional_t<oneBitThresh, decltype(bump_cache), int> unc_bump_cache;
+
+#ifndef RIBBON_PASS_HASH
+            auto next = *(begin + input[start_index].second);
+#endif
+
+            for (Index i = start_index; i < end_index; ++i) {
+#ifdef RIBBON_PASS_HASH
+                const auto [sortpos, idx, hash] = input[i];
+#else
+                const auto [sortpos, idx] = input[i];
+#endif
+                const Index start = Hasher::SortToStart(sortpos),
+                            val = Hasher::GetIntraBucket(sortpos),
+                            cval = hasher.Compress(val),
+                            bucket = Hasher::GetBucket(sortpos);
+                assert(bucket >= last_bucket);
+                assert(oneBitThresh || cval < Hasher::NoBumpThresh());
+
+#ifndef RIBBON_PASS_HASH
+                const Hash hash = hasher.GetHash(next);
+                if (i + 1 < num_items)
+                    next = *(begin + input[i + 1].second);
+
+                // prefetch the cache miss far in advance, assuming the iterator
+                // is to contiguous storage
+                if (TLX_LIKELY(i + 32 < num_items))
+                    __builtin_prefetch(&*begin + input[i + 32].second, 0, 1);
+#endif
+
+                if (bucket != last_bucket) {
+                    // moving to next bucket
+                    sLOG << "Moving to bucket" << bucket << "was" << last_bucket;
+                    if constexpr (oneBitThresh) {
+                        unc_bump_cache.clear();
+                        last_val = val;
+                    }
+                    if (thresh == Hasher::NoBumpThresh()) {
+                        sLOG << "Bucket" << last_bucket << "has no bumped items";
+                        std::scoped_lock lock(meta_mtx);
+                        bs->SetMeta(last_bucket, thresh);
+                    }
+                    all_good = true;
+                    last_bucket = bucket;
+                    thresh = Hasher::NoBumpThresh(); // maximum == "no bumpage"
+                    last_cval = cval;
+                    bump_cache.clear();
+                } else if (!all_good) {
+                    // direct hard bump
+                    sLOG << "Directly bumping" << tlx::wrap_unprintable(*(begin + idx))
+                         << "from bucket" << bucket << "val" << val << cval << "start"
+                         << start << "sort" << sortpos << "hash" << std::hex << hash
+                         << "data"
+                         << (uint64_t)(Hasher::kIsFilter
+                                           ? hasher.GetResultRowFromHash(hash)
+                                           : hasher.GetResultRowFromInput(*(begin + idx)))
+                         << std::dec;
+                    thread_bump_vecs[ti].push_back(*(begin + idx));
+                    continue;
+                } else if (cval != last_cval) {
+                    // clear bump cache
+                    sLOG << "Bucket" << bucket << "cval" << cval << "!=" << last_cval;
+                    bump_cache.clear();
+                    last_cval = cval;
+                }
+                if constexpr (oneBitThresh) {
+                    // split into constexpr and normal if because unc_bump_cache isn't a
+                    // vector if !oneBitThresh
+                    if (val != last_val) {
+                        unc_bump_cache.clear();
+                        last_val = val;
+                    }
+                }
+
+
+                const CoeffRow cr = hasher.GetCoeffs(hash);
+                const ResultRow rr = Hasher::kIsFilter
+                                         ? hasher.GetResultRowFromHash(hash)
+                                         : hasher.GetResultRowFromInput(*(begin + idx));
+
+                auto [success, row] = BandingAdd<kFCA1>(bs, start, cr, rr);
+                if (!success) {
+                    assert(all_good);
+                    /* FIXME: this doesn't really make sense in the parallel case
+                       because it requires bumping to work */
+                    if (bump_vec == nullptr) {
+                        // bumping disabled, abort!
+                        thread_ret[ti] = 0;
+                        return;
+                    }
+                    // if we got this far, this is the first failure in this bucket,
+                    // and we need to undo insertions with the same cval
+                    sLOG << "First failure in bucket" << bucket << "val" << val
+                         << "start" << start << "sort" << sortpos << "hash" << std::hex
+                         << hash << "data" << (uint64_t)rr << std::dec << "for item"
+                         << tlx::wrap_unprintable(*(begin + idx)) << "-> threshold"
+                         << cval << "clash in row" << row;
+                    thresh = cval;
+                    if constexpr (oneBitThresh) {
+                        if (cval == 2) {
+                            sLOG << "First failure in bucket" << bucket << "val" << val
+                                 << "is a 'plus' case (below threshold)";
+                            // "plus" case: store uncompressed threshold in hash table
+                            {
+                                std::scoped_lock lock(hash_mtx);
+                                hasher.Set(bucket, val);
+                            }
+                            // Set meta to 0 (some bumpage) but keep thresh at 2 so that
+                            // we don't retroactively bump everything when moving to the
+                            // next bucket
+                            {
+                                std::scoped_lock lock(meta_mtx);
+                                bs->SetMeta(bucket, 0);
+                            }
+                            all_good = false;
+
+                            // bump all items with the same uncompressed value
+                            do_bump(thread_bump_vecs[ti], unc_bump_cache);
+                            sLOG << "Also bumping"
+                                 << tlx::wrap_unprintable(*(begin + idx));
+                            thread_bump_vecs[ti].push_back(*(begin + idx));
+                            // proceed to next item, don't do regular bumping (but only
+                            // if cval == 2, not generally!)
+                            continue;
+                        }
+                    }
+                    {
+                        std::scoped_lock lock(meta_mtx);
+                        bs->SetMeta(bucket, thresh);
+                    }
+                    all_good = false;
+
+                    do_bump(thread_bump_vecs[ti], bump_cache);
+                    thread_bump_vecs[ti].push_back(*(begin + idx));
+                } else {
+                    sLOG << "Insertion succeeded of item"
+                         << tlx::wrap_unprintable(*(begin + idx)) << "in pos" << row
+                         << "bucket" << bucket << "val" << val << cval << "start"
+                         << start << "sort" << sortpos << "hash" << std::hex << hash
+                         << "data" << (uint64_t)rr << std::dec;
+                    bump_cache.emplace_back(row, idx);
+                    if constexpr (oneBitThresh) {
+                        // also record in bump cache for uncompressed values
+                        unc_bump_cache.emplace_back(row, idx);
+                    }
+                }
+            }
+            // set final threshold
+            if (thresh == Hasher::NoBumpThresh()) {
+                std::scoped_lock lock(meta_mtx);
+                bs->SetMeta(last_bucket, thresh);
+            }
+            thread_ret[ti] = 1;
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    /* NOTE: in the end, sizes of all bump vectors are known, so we could manually manipulate the
+       original bump vector by resizing it and then copying the individual bump vecs in parallel */
+    std::size_t total_size = 0;
+    for (auto& v : thread_bump_vecs) {
+        total_size += v.size();
+    }
+    bump_vec->reserve(bump_vec->size() + total_size);
+    for (auto& v : thread_bump_vecs) {
+        bump_vec->insert(bump_vec->end(), v.begin(), v.end());
     }
 
     // migrate thresholds to hash table

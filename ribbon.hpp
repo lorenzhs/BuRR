@@ -141,7 +141,7 @@ public:
         Iterator begin, Iterator end,
         std::vector<std::conditional_t<
             kUseMHC, std::conditional_t<kIsFilter, mhc_or_key_t, std::pair<mhc_or_key_t, ResultRow>>,
-            typename std::iterator_traits<Iterator>::value_type>> *bump_vec) {
+            typename std::iterator_traits<Iterator>::value_type>> *bump_vec, std::size_t num_threads = 0) {
         const auto input_size = end - begin;
         LOGC(Config::log) << "Constructing for " << storage_.GetNumSlots()
                           << " slots, " << storage_.GetNumStarts() << " starts, "
@@ -152,7 +152,10 @@ public:
         if constexpr (kUseMHC) {
             success = BandingAddRangeMHC(&storage_, hasher_, begin, end, bump_vec);
         } else {
-            success = BandingAddRange(&storage_, hasher_, begin, end, bump_vec);
+            if (num_threads == 0)
+                success = BandingAddRange(&storage_, hasher_, begin, end, bump_vec);
+            else
+                success = BandingAddRangeParallel(&storage_, hasher_, begin, end, bump_vec, num_threads);
         }
         LOGC(Config::log) << "Insertion of " << input_size << " items took "
                           << timer.ElapsedNanos(true) / 1e6 << "ms";
@@ -386,13 +389,13 @@ public:
     }
 
     template <typename Iterator, typename C = Config>
-    std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end) {
+    std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
         const auto input_size = end - begin;
         std::vector<std::conditional_t<kIsFilter, Key, std::pair<Key, ResultRow>>> bumped_items;
         bumped_items.reserve(std::max(
             0l, static_cast<ssize_t>((1 - slots_per_item_) * input_size)));
 
-        if (!Super::AddRange(begin, end, &bumped_items))
+        if (!Super::AddRange(begin, end, &bumped_items, num_threads))
             return false;
 
         if (bumped_items.size() == 0)
@@ -403,12 +406,14 @@ public:
                      static_cast<size_t>(slots_per_item_ * bumped_items.size()));
         child_ribbon_.Prepare(child_slots);
         return child_ribbon_.AddRange(bumped_items.data(),
-                                      bumped_items.data() + bumped_items.size());
+                                      bumped_items.data() + bumped_items.size(), num_threads);
     }
 
+    /* FIXME: also parallelize MHC versions */
     // MHC version
     template <typename Iterator, typename C = Config>
-    std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end) {
+    std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
+        (void)num_threads;
         auto input = Super::PrepareAddRangeMHC(begin, end);
         return AddRangeMHCInternal(input.get(), input.get() + (end - begin));
     }
@@ -558,14 +563,16 @@ public:
     }
 
     template <typename Iterator, typename C = Config>
-    std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end) {
+    std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
+        (void)num_threads;
         // there's really no distinction in the base case
         return AddRangeMHCInternal(begin, end);
     }
 
     // MHC version
     template <typename Iterator, typename C = Config>
-    std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end) {
+    std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
+        (void)num_threads;
         auto input = Super::PrepareAddRangeMHC(begin, end);
         return AddRangeMHCInternal(input.get(), input.get() + (end - begin));
     }
