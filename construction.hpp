@@ -447,9 +447,8 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     std::vector<char> thread_ret(num_threads);
     /* FIXME: sensible reserve() for these */
     std::vector<BumpStorage> thread_bump_vecs(num_threads);
-    /* FIXME: make hasher.Set and bs->SetMeta concurrent to remove these mutexes */
+    /* FIXME: make hasher.Set concurrent to remove these mutexes */
     [[maybe_unused]] std::conditional_t<oneBitThresh, std::mutex, int> hash_mtx;
-    std::mutex meta_mtx;
     for (std::size_t ti = 0; ti < num_threads; ++ti) {
         threads.emplace_back([&, ti]() {
             Index start_bucket = ti * buckets_per_thread;
@@ -486,16 +485,11 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                                 std::scoped_lock lock(hash_mtx);
                                 hasher.Set(bucket, val);
                             }
-                            {
-                                std::scoped_lock lock(meta_mtx);
-                                bs->SetMeta(bucket, 0);
-                            }
+                            bs->SetMeta(bucket, 0);
                         } else {
-                            std::scoped_lock lock(meta_mtx);
                             bs->SetMeta(bucket, cval);
                         }
                     } else {
-                        std::scoped_lock lock(meta_mtx);
                         bs->SetMeta(bucket, cval);
                     }
                 }
@@ -555,7 +549,6 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                     }
                     if (thresh == Hasher::NoBumpThresh()) {
                         sLOG << "Bucket" << last_bucket << "has no bumped items";
-                        std::scoped_lock lock(meta_mtx);
                         bs->SetMeta(last_bucket, thresh);
                     }
                     all_good = true;
@@ -627,7 +620,6 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                             // we don't retroactively bump everything when moving to the
                             // next bucket
                             {
-                                std::scoped_lock lock(meta_mtx);
                                 bs->SetMeta(bucket, 0);
                             }
                             all_good = false;
@@ -642,10 +634,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                             continue;
                         }
                     }
-                    {
-                        std::scoped_lock lock(meta_mtx);
-                        bs->SetMeta(bucket, thresh);
-                    }
+                    bs->SetMeta(bucket, thresh);
                     all_good = false;
 
                     do_bump(thread_bump_vecs[ti], bump_cache);
@@ -665,7 +654,6 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
             }
             // set final threshold
             if (thresh == Hasher::NoBumpThresh()) {
-                std::scoped_lock lock(meta_mtx);
                 bs->SetMeta(last_bucket, thresh);
             }
             thread_ret[ti] = 1;

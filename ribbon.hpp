@@ -33,10 +33,13 @@ struct BaseConfig : Config {
 };
 
 // Ribbon base class
-template <typename Config>
+template <typename Config, bool concurrent = false>
 class ribbon_base {
+/* FIXME: This is probably not needed because it doesn't seem as if the
+   cache line storage is ever used concurrently (at least SetMeta) anyways */
 public:
     IMPORT_RIBBON_CONFIG(Config);
+    static_assert(!concurrent || !kUseCacheLineStorage);
     using Hasher = ChooseThreshold<Config>;
     using mhc_or_key_t = typename HashTraits<Hasher>::mhc_or_key_t;
 
@@ -316,7 +319,7 @@ protected:
 
     // actual data
     double slots_per_item_;
-    BasicStorage<Config> storage_;
+    BasicStorage<Config, concurrent> storage_;
 
     template <bool /* cls */, bool /* int */, typename C>
     struct sol_t {
@@ -330,7 +333,12 @@ protected:
     };
     template <typename C>
     struct sol_t<false, true, C> {
-        using type = InterleavedSolutionStorage<C>;
+        /* FIXME: I don't think this needs to be set concurrent
+           because only GetMeta is used, but this makes swapping
+           the pointers for the metadata storage possible when
+           storage_ is concurrent. This might not be the best
+           option, though. */
+        using type = InterleavedSolutionStorage<C, concurrent>;
     };
 
     typename sol_t<kUseCacheLineStorage, kUseInterleavedSol, Config>::type sol_;
@@ -339,11 +347,11 @@ protected:
 
 } // namespace
 
-template <uint8_t depth, typename Config>
-class ribbon_filter : public ribbon_base<Config> {
+template <uint8_t depth, typename Config, bool concurrent = false>
+class ribbon_filter : public ribbon_base<Config, concurrent> {
 public:
     IMPORT_RIBBON_CONFIG(Config);
-    using Super = ribbon_base<Config>;
+    using Super = ribbon_base<Config, concurrent>;
     using Super::slots_per_item_;
     using mhc_or_key_t = typename Super::mhc_or_key_t;
 
@@ -507,18 +515,18 @@ protected:
             bumped_items.data(), bumped_items.data() + bumped_items.size());
     }
 
-    ribbon_filter<depth - 1, Config> child_ribbon_;
+    ribbon_filter<depth - 1, Config, concurrent> child_ribbon_;
 
-    friend ribbon_filter<depth + 1, Config>;
+    friend ribbon_filter<depth + 1, Config, concurrent>;
     friend Super;
 };
 
 // base case ribbon
-template <typename Config>
-class ribbon_filter<0u, Config> : public ribbon_base<BaseConfig<Config>> {
+template <typename Config, bool concurrent>
+class ribbon_filter<0u, Config, concurrent> : public ribbon_base<BaseConfig<Config>, concurrent> {
 public:
     IMPORT_RIBBON_CONFIG(BaseConfig<Config>);
-    using Super = ribbon_base<BaseConfig<Config>>;
+    using Super = ribbon_base<BaseConfig<Config>, concurrent>;
 
     double base_slots_per_item_ = 1.0;
 
@@ -635,7 +643,7 @@ protected:
 
     size_t orig_num_slots_;
     double parent_slots_per_item_;
-    friend ribbon_filter<1, Config>;
+    friend ribbon_filter<1, Config, concurrent>;
     friend Super;
 };
 
