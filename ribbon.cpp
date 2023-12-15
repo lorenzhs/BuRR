@@ -43,17 +43,17 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads) {
     std::iota(input.get(), input.get() + num_items, 0);
     LOG1 << "Input generation took " << timer.ElapsedNanos(true) / 1e6 << "ms";
 
-    ribbon_filter<depth, Config> rs(num_slots, slots_per_item, seed);
-    ribbon_filter<depth, Config, true> r(num_slots, slots_per_item, seed);
+    ribbon_filter<depth, Config, false> rs(num_slots, slots_per_item, seed, 0);
+    ribbon_filter<depth, Config, true> r(num_slots, slots_per_item, seed, std::thread::hardware_concurrency());
 
     LOG1 << "Allocation took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
 
     LOG1 << "Adding rows to filter....";
-    rs.AddRange(input.get(), input.get() + num_items, 0);
+    rs.AddRange(input.get(), input.get() + num_items);
     LOG1 << "Insertion took " << timer.ElapsedNanos(true) / 1e6 << "ms in total\n";
 
     LOG1 << "Adding rows to filter (parallel, " << std::thread::hardware_concurrency() << " threads)....";
-    r.AddRange(input.get(), input.get() + num_items, std::thread::hardware_concurrency());
+    r.AddRange(input.get(), input.get() + num_items);
     LOG1 << "Insertion took " << timer.ElapsedNanos(true) / 1e6 << "ms in total\n";
 
     input.reset();
