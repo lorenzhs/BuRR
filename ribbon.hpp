@@ -33,22 +33,18 @@ struct BaseConfig : Config {
 };
 
 // Ribbon base class
-template <typename Config, bool concurrent>
+template <typename Config, bool concurrent = false>
 class ribbon_base {
+/* FIXME: This is probably not needed because it doesn't seem as if the
+   cache line storage is ever used concurrently (at least SetMeta) anyways */
 public:
     IMPORT_RIBBON_CONFIG(Config);
+    static_assert(!concurrent || !kUseCacheLineStorage);
     using Hasher = ChooseThreshold<Config>;
     using mhc_or_key_t = typename HashTraits<Hasher>::mhc_or_key_t;
 
-    /* ribbon_base() {} */
-    /* FIXME: better interface here - num_threads can't be an optional argument because
-       that makes the two constructors conflict (but this way is also really confusing) */
-    ribbon_base(size_t num_slots, double slots_per_item, uint64_t seed, size_t num_threads)
-    : num_threads_(num_threads),
-      storage_(num_threads),
-      sol_(num_threads) {
-        assert(concurrent || num_threads == 0);
-        assert(num_threads > 0 || !concurrent);
+    ribbon_base() {}
+    ribbon_base(size_t num_slots, double slots_per_item, uint64_t seed) {
         if constexpr (!Config::kUseMHC)
             Init(num_slots, slots_per_item, seed);
         else
@@ -57,12 +53,7 @@ public:
 
     // TODO make this invalid if !kUseMHC
     ribbon_base(size_t num_slots, double slots_per_item, uint64_t seed,
-                uint32_t idx, size_t num_threads)
-    : num_threads_(num_threads),
-      storage_(num_threads),
-      sol_(num_threads) {
-        assert(concurrent || num_threads == 0);
-        assert(num_threads > 0 || !concurrent);
+                uint32_t idx) {
         if constexpr (Config::kUseMHC)
             Init(num_slots, slots_per_item, seed, idx);
         else
@@ -153,7 +144,7 @@ public:
         Iterator begin, Iterator end,
         std::vector<std::conditional_t<
             kUseMHC, std::conditional_t<kIsFilter, mhc_or_key_t, std::pair<mhc_or_key_t, ResultRow>>,
-            typename std::iterator_traits<Iterator>::value_type>> *bump_vec) {
+            typename std::iterator_traits<Iterator>::value_type>> *bump_vec, std::size_t num_threads = 0) {
         const auto input_size = end - begin;
         LOGC(Config::log) << "Constructing for " << storage_.GetNumSlots()
                           << " slots, " << storage_.GetNumStarts() << " starts, "
@@ -164,10 +155,10 @@ public:
         if constexpr (kUseMHC) {
             success = BandingAddRangeMHC(&storage_, hasher_, begin, end, bump_vec);
         } else {
-            if (num_threads_ == 0)
+            if (num_threads == 0)
                 success = BandingAddRange(&storage_, hasher_, begin, end, bump_vec);
             else
-                success = BandingAddRangeParallel(&storage_, hasher_, begin, end, bump_vec);
+                success = BandingAddRangeParallel(&storage_, hasher_, begin, end, bump_vec, num_threads);
         }
         LOGC(Config::log) << "Insertion of " << input_size << " items took "
                           << timer.ElapsedNanos(true) / 1e6 << "ms";
@@ -192,12 +183,6 @@ public:
         rocksdb::StopWatchNano timer(true);
         if constexpr (kUseInterleavedSol) {
             InterleavedBackSubst(storage_, &sol_);
-            /* FIXME: I don't think sol_ actually needs to
-               be concurrent because SetMeta isn't used
-               at this point. The only reason for also
-               making it concurrent is to make swapping
-               the pointers possible. I'm not sure if
-               that's the best method, though. */
             // move metadata by swapping pointers
             sol_.MoveMetadata(&storage_);
             storage_.Reset();
@@ -293,13 +278,6 @@ public:
     */
 
 protected:
-    /* This is only here so the base case ribbon can properly
-       initialize num_threads and the associated data structures. */
-    ribbon_base(size_t num_threads)
-    : num_threads_(num_threads),
-      storage_(num_threads),
-      sol_(num_threads) {}
-
     void Prepare(size_t num_slots) {
         if (num_slots == 0)
             return;
@@ -340,14 +318,12 @@ protected:
     ssize_t empty_slots;
 
     // actual data
-    size_t num_threads_;
     double slots_per_item_;
     BasicStorage<Config, concurrent> storage_;
 
     template <bool /* cls */, bool /* int */, typename C>
     struct sol_t {
         // dummy
-        sol_t(size_t) {}
         using type = sol_t<false, false, C>;
     };
 
@@ -357,6 +333,11 @@ protected:
     };
     template <typename C>
     struct sol_t<false, true, C> {
+        /* FIXME: I don't think this needs to be set concurrent
+           because only GetMeta is used, but this makes swapping
+           the pointers for the metadata storage possible when
+           storage_ is concurrent. This might not be the best
+           option, though. */
         using type = InterleavedSolutionStorage<C, concurrent>;
     };
 
@@ -366,7 +347,7 @@ protected:
 
 } // namespace
 
-template <uint8_t depth, typename Config, bool concurrent>
+template <uint8_t depth, typename Config, bool concurrent = false>
 class ribbon_filter : public ribbon_base<Config, concurrent> {
 public:
     IMPORT_RIBBON_CONFIG(Config);
@@ -374,35 +355,30 @@ public:
     using Super::slots_per_item_;
     using mhc_or_key_t = typename Super::mhc_or_key_t;
 
-    /* FIXME: maybe change the interface to allow the number of
-       threads to be changed later - that would allow a default
-       constructor, but would also be dangerous because
-       everything would have to be updated properly for the new
-       number of threads */
-    /* ribbon_filter() = default; */
+    ribbon_filter() = default;
 
     // MHC top-level constructor
     template <typename C = Config>
-    ribbon_filter(size_t num_slots, double slots_per_item, uint64_t seed, size_t num_threads,
+    ribbon_filter(size_t num_slots, double slots_per_item, uint64_t seed,
                   typename std::enable_if<C::kUseMHC>::type * = 0)
-        : Super(num_slots, slots_per_item, seed, 0, num_threads),
-          child_ribbon_(0, slots_per_item, seed, 1, num_threads) {}
+        : Super(num_slots, slots_per_item, seed, 0),
+          child_ribbon_(0, slots_per_item, seed, 1) {}
 
 protected:
     // MHC child constructor
     template <typename C = Config>
-    ribbon_filter(size_t num_slots, double slots_per_item, uint64_t seed, uint32_t idx,
-                  size_t num_threads, typename std::enable_if<C::kUseMHC>::type * = 0)
-        : Super(num_slots, slots_per_item, seed, idx, num_threads),
-          child_ribbon_(0, slots_per_item, seed, idx + 1, num_threads) {}
+    ribbon_filter(size_t num_slots, double slots_per_item, uint64_t seed,
+                  uint32_t idx, typename std::enable_if<C::kUseMHC>::type * = 0)
+        : Super(num_slots, slots_per_item, seed, idx),
+          child_ribbon_(0, slots_per_item, seed, idx + 1) {}
 
 public:
     // non-MHC top-level constructor
     template <typename C = Config>
-    ribbon_filter(size_t num_slots, double slots_per_item, uint64_t seed, size_t num_threads,
+    ribbon_filter(size_t num_slots, double slots_per_item, uint64_t seed,
                   typename std::enable_if<!C::kUseMHC>::type * = 0)
-        : Super(num_slots, slots_per_item, seed, num_threads),
-          child_ribbon_(0, slots_per_item, seed + 1, num_threads) {}
+        : Super(num_slots, slots_per_item, seed),
+          child_ribbon_(0, slots_per_item, seed + 1) {}
 
     // non-MHC init
     template <typename C = Config>
@@ -421,13 +397,13 @@ public:
     }
 
     template <typename Iterator, typename C = Config>
-    std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end) {
+    std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
         const auto input_size = end - begin;
         std::vector<std::conditional_t<kIsFilter, Key, std::pair<Key, ResultRow>>> bumped_items;
         bumped_items.reserve(std::max(
             0l, static_cast<ssize_t>((1 - slots_per_item_) * input_size)));
 
-        if (!Super::AddRange(begin, end, &bumped_items))
+        if (!Super::AddRange(begin, end, &bumped_items, num_threads))
             return false;
 
         if (bumped_items.size() == 0)
@@ -438,13 +414,14 @@ public:
                      static_cast<size_t>(slots_per_item_ * bumped_items.size()));
         child_ribbon_.Prepare(child_slots);
         return child_ribbon_.AddRange(bumped_items.data(),
-                                      bumped_items.data() + bumped_items.size());
+                                      bumped_items.data() + bumped_items.size(), num_threads);
     }
 
     /* FIXME: also parallelize MHC versions */
     // MHC version
     template <typename Iterator, typename C = Config>
-    std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end) {
+    std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
+        (void)num_threads;
         auto input = Super::PrepareAddRangeMHC(begin, end);
         return AddRangeMHCInternal(input.get(), input.get() + (end - begin));
     }
@@ -553,9 +530,8 @@ public:
 
     double base_slots_per_item_ = 1.0;
 
-    /* ribbon_filter() = default; */
-    ribbon_filter(size_t num_slots, double parent_slots_per_item, uint64_t seed, size_t num_threads)
-    : Super(num_threads) {
+    ribbon_filter() = default;
+    ribbon_filter(size_t num_slots, double parent_slots_per_item, uint64_t seed) {
         if constexpr (!Config::kUseMHC) {
             Init(num_slots, parent_slots_per_item, seed);
         } else {
@@ -564,8 +540,7 @@ public:
         }
     }
     ribbon_filter(size_t num_slots, double parent_slots_per_item, uint64_t seed,
-                  uint32_t idx, size_t num_threads)
-    : Super(num_threads) {
+                  uint32_t idx) {
         if constexpr (Config::kUseMHC) {
             Init(num_slots, parent_slots_per_item, seed, idx);
         } else {
@@ -596,14 +571,16 @@ public:
     }
 
     template <typename Iterator, typename C = Config>
-    std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end) {
+    std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
+        (void)num_threads;
         // there's really no distinction in the base case
         return AddRangeMHCInternal(begin, end);
     }
 
     // MHC version
     template <typename Iterator, typename C = Config>
-    std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end) {
+    std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
+        (void)num_threads;
         auto input = Super::PrepareAddRangeMHC(begin, end);
         return AddRangeMHCInternal(input.get(), input.get() + (end - begin));
     }

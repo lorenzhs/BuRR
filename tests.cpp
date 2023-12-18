@@ -61,7 +61,7 @@ void CacheLineStorageTest() {
     using ResultRow = typename Config::ResultRow;
     const size_t num_slots = 1024, num_buckets = num_slots / Config::kBucketSize;
     const ResultRow mask = (1u << Config::kResultBits) - 1;
-    CacheLineStorage<Config> s(num_slots, 0);
+    CacheLineStorage<Config> s(num_slots);
     const ResultRow metamask = Config::kThreshMode == ThreshMode::onebit
                                    ? 1
                                    : (Config::kThreshMode == ThreshMode::twobit
@@ -103,7 +103,7 @@ void BasicFilterTest(size_t num_items) {
 
     ribbon::test::StandardKeyGen begin("in", 0), end("in", num_to_add);
 
-    BasicStorage<Config> storage(num_slots, 0);
+    BasicStorage<Config> storage(num_slots);
     NormalThreshold<Config> hasher(42);
 
     std::vector<std::string> bumped;
@@ -141,7 +141,7 @@ void BasicRibbonTest(size_t input_size) {
     std::vector<int> input(input_size);
     std::iota(input.begin(), input.end(), 0);
 
-    ribbon::ribbon_filter<depth, Config, false> r(input_size, 0.95, 42, 0);
+    ribbon::ribbon_filter<depth, Config> r(input_size, 0.95, 42);
     r.AddRange(input.begin(), input.end());
     r.BackSubst();
 
@@ -195,7 +195,7 @@ void BasicRibbonRetrievalTest(size_t input_size) {
         input.emplace_back(i, static_cast<Value>(rng(max)));
     }
 
-    ribbon::ribbon_filter<depth, Config, false> r(input_size, 0.95, 42, 0);
+    ribbon::ribbon_filter<depth, Config> r(input_size, 0.95, 42);
     r.AddRange(input.begin(), input.end());
     r.BackSubst();
 
@@ -223,7 +223,7 @@ void BasicRetrievalTest(size_t num_items) {
 
     ribbon::test::RetrievalInputGen begin("in", 0), end("in", num_to_add);
 
-    BasicStorage<Config> storage(num_slots, 0);
+    BasicStorage<Config> storage(num_slots);
     NormalThreshold<Config> hasher(42);
 
     std::vector<std::pair<std::string, uint8_t>> bumped;

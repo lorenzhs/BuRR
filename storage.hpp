@@ -11,16 +11,16 @@
 #include <memory>
 #include <atomic>
 
-/* FIXME: change this so there's a method "SetNumThreads"
-   The current way is much too dangerous because the num_threads
-   constructor conflicts with the old constructor for setting
-   the number of slots */
 namespace ribbon {
 
+/* FIXME: maybe just add artificial gaps so different threads can't
+   get into conflict with each other in order to avoid all the atomics */
+/* NOTE: This isn't a fully concurrent implementation. In particular,
+   calling GetMeta while other threads are writing can lead to inconsistent
+   results if a metadata value crosses the boundary between two elements in
+   the underlying array. This should not be problem for BuRR, however,
+   because the parallel parts don't call both SetMeta and GetMeta */
 namespace {
-/* concurrent is redundant since num_threads is also stores, but
-   it's necessary to completely separate the sequential version
-   from the parallel version at compile-time */
 template <typename Config, bool concurrent = false>
 class MetaStorage {
 public:
@@ -44,36 +44,23 @@ public:
     static constexpr Index shift_mask = items_per_fetch - 1;
 
 
-    MetaStorage(size_t num_threads)
-    : num_threads_(num_threads) {
-        assert(concurrent || num_threads == 0);
-        assert(num_threads > 0 || !concurrent);
-    }
-
     void Prepare(size_t num_slots) {
         assert(num_slots >= kCoeffBits);
         num_slots_ = num_slots;
         Index num_starts = num_slots - kCoeffBits + 1;
         num_buckets_ = (num_starts + kBucketSize - 1) / kBucketSize;
-        if constexpr (concurrent) {
-            buckets_per_thread_ = (num_buckets_ + num_threads_ - 1) / num_threads_;
-            meta_per_thread_ = (buckets_per_thread_ * meta_bits + meta_t_bits - 1) / meta_t_bits + !div_clean;
-        }
 
         // +!div_clean at the end so we don't fetch beyond the bounds, even if
         // we don't use it
-        size_t size = GetMetaSize() + !div_clean * (num_threads_ > 0 ? num_threads_ : 1);
+        size_t size = GetMetaSize() + !div_clean;
         sLOGC(Config::log) << "Meta: allocating" << size << "entries of"
                            << sizeof(meta_t) << "Bytes each";
-        meta_ = std::make_unique<meta_t[]>(size);
-        /* FIXME: adapt these asserts to the multithreaded version */
-        /*
+        meta_ = std::make_unique<std::conditional_t<concurrent, std::atomic<meta_t>, meta_t>[]>(size);
         if constexpr (kThreshMode == ThreshMode::onebit) {
             assert(size == (num_buckets_ + 7) / 8);
         } else if constexpr (kThreshMode == ThreshMode::twobit) {
             assert(size == (num_buckets_ + 3) / 4);
         }
-        */
     }
     void Reset() {
         meta_.reset();
@@ -87,35 +74,29 @@ public:
     }
     inline meta_t GetMeta(Index bucket) const {
         assert(bucket < num_buckets_);
-        if constexpr (concurrent)
-            assert(buckets_per_thread_ > 0);
         if constexpr (div_clean) {
-            Index pos;
-            if constexpr (concurrent) {
-                pos = bucket / buckets_per_thread_ * meta_per_thread_;
-                /* bucket needs to be modified so 'bucket & shift_mask'
-                   still makes sense later */
-                bucket %= buckets_per_thread_;
-                pos += bucket / items_per_fetch;
-            } else {
-                pos = bucket / items_per_fetch;
-            }
-            const meta_t fetch = meta_[pos];
+            const meta_t fetch = meta_[bucket / items_per_fetch];
             const unsigned shift = meta_bits * (bucket & shift_mask);
             assert(shift < fetch_bits);
             return (fetch >> shift) & extractor_mask;
         } else {
-            Index start_bit;
             // find the fetch position first
-            if constexpr (concurrent) {
-                Index before_thread = bucket / buckets_per_thread_ * meta_per_thread_;
-                start_bit = before_thread * meta_t_bits + (bucket % buckets_per_thread_) * meta_bits;
-            } else {
-                start_bit = bucket * meta_bits;
-            }
+            Index start_bit = bucket * meta_bits;
             Index fetch_bucket = start_bit / meta_t_bits;
             fetch_t fetch;
-            memcpy(&fetch, meta_.get() + fetch_bucket, sizeof(fetch_t));
+            if constexpr(concurrent) {
+                /* FIXME: Check whether this works properly. If I understand
+                   correctly, fetch_bits will always be exactly 2 * meta_t_bits
+                   (if !div_clean) because of the possible types given by
+                   at_least_t */
+                assert(fetch_bits == 2 * meta_t_bits);
+                /* FIXME: on big-endian architectures, this is different than the
+                   memcpy version below (but as long as it's compatible with SetMeta,
+                   I guess that shouldn't matter) */
+                fetch = (fetch_t{meta_[fetch_bucket + 1]} << meta_t_bits) | meta_[fetch_bucket];
+            } else {
+                memcpy(&fetch, meta_.get() + fetch_bucket, sizeof(fetch_t));
+            }
             // start_bit now indicates which bits of 'fetch' we need
             start_bit -= fetch_bucket * meta_t_bits;
             return (fetch >> start_bit) & extractor_mask;
@@ -124,36 +105,47 @@ public:
     inline void SetMeta(Index bucket, meta_t val) {
         assert(bucket < num_buckets_);
         assert(val <= extractor_mask);
-        if constexpr (concurrent)
-            assert(buckets_per_thread_ > 0);
         if constexpr (div_clean) {
-            Index pos;
-            if constexpr (concurrent) {
-                pos = bucket / buckets_per_thread_ * meta_per_thread_;
-                bucket %= buckets_per_thread_;
-                pos += bucket / items_per_fetch;
-            } else {
-                pos = bucket / items_per_fetch;
-            }
+            const Index pos = bucket / items_per_fetch;
             const unsigned shift = meta_bits * (bucket & shift_mask);
-            meta_[pos] &= ~static_cast<meta_t>(extractor_mask << shift);
-            meta_[pos] |= (val << shift);
-        } else {
-            Index start_bit;
-            // find the fetch position first
-            if constexpr (concurrent) {
-                Index before_thread = bucket / buckets_per_thread_ * meta_per_thread_;
-                start_bit = before_thread * meta_t_bits + (bucket % buckets_per_thread_) * meta_bits;
+            if constexpr(concurrent) {
+                meta_t oldmeta, newmeta;
+                do {
+                    oldmeta = meta_[pos];
+                    newmeta = oldmeta & ~static_cast<meta_t>(extractor_mask << shift);
+                    newmeta |= (val << shift);
+                } while (!meta_[pos].compare_exchange_weak(oldmeta, newmeta));
             } else {
-                start_bit = bucket * meta_bits;
+                meta_[pos] &= ~static_cast<meta_t>(extractor_mask << shift);
+                meta_[pos] |= (val << shift);
             }
+        } else {
+            // find the fetch position first
+            Index start_bit = bucket * meta_bits;
             Index fetch_bucket = start_bit / meta_t_bits;
             // start_bit now indicates which bits of 'fetch' we need
             start_bit -= fetch_bucket * meta_t_bits;
-            fetch_t* fetch =
-                reinterpret_cast<fetch_t*>(meta_.get() + fetch_bucket);
-            *fetch &= ~(extractor_mask << start_bit);
-            *fetch |= (val << start_bit);
+            if constexpr(concurrent) {
+                fetch_t fetch;
+                meta_t oldmeta1, oldmeta2;
+                do {
+                    oldmeta1 = meta_[fetch_bucket];
+                    oldmeta2 = meta_[fetch_bucket + 1];
+                    fetch = (fetch_t{oldmeta2} << meta_t_bits) | oldmeta1;
+                    fetch &= ~(extractor_mask << start_bit);
+                    fetch |= (val << start_bit);
+                    /* NOTE: GetMeta cannot be used concurrently (on the same bucket) as SetMeta
+                       because this updates the two parts independently. */
+                    /* FIXME: if one of these succeeds, that wouldn't need to be retried, but
+                       it might be wasted effort to try to optimize that. */
+                } while(!meta_[fetch_bucket].compare_exchange_weak(oldmeta1, static_cast<meta_t>(fetch)) ||
+                        !meta_[fetch_bucket + 1].compare_exchange_weak(oldmeta2, static_cast<meta_t>(fetch >> meta_t_bits)));
+            } else {
+                fetch_t* fetch =
+                    reinterpret_cast<fetch_t*>(meta_.get() + fetch_bucket);
+                *fetch &= ~(extractor_mask << start_bit);
+                *fetch |= (val << start_bit);
+            }
         }
         assert(GetMeta(bucket) == val);
     }
@@ -162,7 +154,6 @@ public:
     template <typename Other>
     void MoveMetadata(Other* other) {
         assert(num_buckets_ == other->num_buckets_);
-        assert(num_threads_ == other->num_threads_);
         meta_.swap(other->meta_);
     }
 
@@ -170,10 +161,6 @@ public:
     inline Index GetNumSlots() const { return num_slots_; }
     inline Index GetNumStarts() const { return num_slots_ - kCoeffBits + 1; }
     inline Index GetNumBuckets() const { return num_buckets_; }
-    /* FIXME: I guess these should also use Index instead of size_t
-       to keep everything consistent */
-    inline size_t GetBucketsPerThread() const { return buckets_per_thread_; }
-    inline size_t GetNumThreads() const { return num_threads_; }
     // clang-format on
 
     size_t Size() const {
@@ -185,16 +172,11 @@ public:
 
 protected:
     size_t GetMetaSize() const {
-        if constexpr (concurrent) {
-            return ((buckets_per_thread_ * meta_bits + meta_t_bits - 1) / meta_t_bits) * num_threads_;
-        } else {
-            return (num_buckets_ * meta_bits + meta_t_bits - 1) / meta_t_bits;
-        }
+        return (num_buckets_ * meta_bits + meta_t_bits - 1) / meta_t_bits;
     }
     // num_buckets_ is for debugging only & can be recomputed easily
-    Index num_slots_ = 0, num_buckets_ = 0, buckets_per_thread_ = 0, meta_per_thread_ = 0;
-    size_t num_threads_;
-    std::unique_ptr<meta_t[]> meta_;
+    Index num_slots_ = 0, num_buckets_ = 0;
+    std::unique_ptr<std::conditional_t<concurrent, std::atomic<meta_t>, meta_t>[]> meta_;
 };
 } // namespace
 
@@ -204,10 +186,8 @@ public:
     IMPORT_RIBBON_CONFIG(Config);
     using Super = MetaStorage<Config, concurrent>;
 
-    /* BasicStorage() = default; */
-    explicit BasicStorage(size_t num_threads) : Super(num_threads) {}
-    explicit BasicStorage(Index num_slots, size_t num_threads)
-    : Super(num_threads) {
+    BasicStorage() = default;
+    explicit BasicStorage(Index num_slots) {
         if (num_slots > 0)
             Prepare(num_slots);
     }
@@ -276,11 +256,9 @@ public:
     IMPORT_RIBBON_CONFIG(Config);
     using Super = MetaStorage<Config, concurrent>;
 
-    /* InterleavedSolutionStorage() = default; */
+    InterleavedSolutionStorage() = default;
 
-    explicit InterleavedSolutionStorage(size_t num_threads) : Super(num_threads) {}
-    explicit InterleavedSolutionStorage(Index num_slots, size_t num_threads)
-    : Super(num_threads) {
+    explicit InterleavedSolutionStorage(Index num_slots) {
         if (num_slots > 0)
             Prepare(num_slots);
     }
@@ -365,16 +343,9 @@ public:
 
     static constexpr bool debug = false;
 
-    /* CacheLineStorage() = default; */
+    CacheLineStorage() = default;
 
-    /* FIXME: this is a bit ugly - it's just to make the interface compatible
-       with the other storage versions here, even though this is never used
-       in a place where concurrent writing is necessary */
-    explicit CacheLineStorage(size_t num_threads) {
-        (void)num_threads;
-    }
-    explicit CacheLineStorage(Index num_slots, size_t num_threads) {
-        (void)num_threads;
+    explicit CacheLineStorage(Index num_slots) {
         // loudly warn about suboptimal config choice
         if constexpr (should_use_compression !=
                       (kThreshMode != ThreshMode::normal)) {

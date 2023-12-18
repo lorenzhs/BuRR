@@ -351,7 +351,7 @@ bool BandingAddRange(BandingStorage *bs, Hasher &hasher, Iterator begin,
 template <typename BandingStorage, typename Hasher, typename Iterator,
           typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
 bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
-                     Iterator end, BumpStorage *bump_vec) {
+                     Iterator end, BumpStorage *bump_vec, std::size_t num_threads) {
     using CoeffRow = typename BandingStorage::CoeffRow;
     using Index = typename BandingStorage::Index;
     using ResultRow = typename BandingStorage::ResultRow;
@@ -368,14 +368,8 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     rocksdb::StopWatchNano timer(true);
     const Index num_starts = bs->GetNumStarts();
     const Index num_buckets = bs->GetNumBuckets();
-    const size_t num_threads = bs->GetNumThreads();
-    const size_t buckets_per_thread = bs->GetBucketsPerThread();
 
-    if (!bump_vec) {
-        LOGC(log) << "bump_vec cannot be null when using the parallel version of AddRange, "
-                  << "falling back to sequential version";
-        return BandingAddRange(bs, hasher, begin, end, bump_vec);
-    }
+    std::size_t buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
     /* FIXME: test what value is best here (2 is minimum for parallel version to work) */
     if (buckets_per_thread < 2)
         return BandingAddRange(bs, hasher, begin, end, bump_vec);
