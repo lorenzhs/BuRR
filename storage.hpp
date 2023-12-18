@@ -9,19 +9,11 @@
 
 #include <cassert>
 #include <memory>
-#include <atomic>
 
 namespace ribbon {
 
-/* FIXME: maybe just add artificial gaps so different threads can't
-   get into conflict with each other in order to avoid all the atomics */
-/* NOTE: This isn't a fully concurrent implementation. In particular,
-   calling GetMeta while other threads are writing can lead to inconsistent
-   results if a metadata value crosses the boundary between two elements in
-   the underlying array. This should not be problem for BuRR, however,
-   because the parallel parts don't call both SetMeta and GetMeta */
 namespace {
-template <typename Config, bool concurrent = false>
+template <typename Config>
 class MetaStorage {
 public:
     IMPORT_RIBBON_CONFIG(Config);
@@ -55,7 +47,7 @@ public:
         size_t size = GetMetaSize() + !div_clean;
         sLOGC(Config::log) << "Meta: allocating" << size << "entries of"
                            << sizeof(meta_t) << "Bytes each";
-        meta_ = std::make_unique<std::conditional_t<concurrent, std::atomic<meta_t>, meta_t>[]>(size);
+        meta_ = std::make_unique<meta_t[]>(size);
         if constexpr (kThreshMode == ThreshMode::onebit) {
             assert(size == (num_buckets_ + 7) / 8);
         } else if constexpr (kThreshMode == ThreshMode::twobit) {
@@ -84,19 +76,7 @@ public:
             Index start_bit = bucket * meta_bits;
             Index fetch_bucket = start_bit / meta_t_bits;
             fetch_t fetch;
-            if constexpr(concurrent) {
-                /* FIXME: Check whether this works properly. If I understand
-                   correctly, fetch_bits will always be exactly 2 * meta_t_bits
-                   (if !div_clean) because of the possible types given by
-                   at_least_t */
-                assert(fetch_bits == 2 * meta_t_bits);
-                /* FIXME: on big-endian architectures, this is different than the
-                   memcpy version below (but as long as it's compatible with SetMeta,
-                   I guess that shouldn't matter) */
-                fetch = (fetch_t{meta_[fetch_bucket + 1]} << meta_t_bits) | meta_[fetch_bucket];
-            } else {
-                memcpy(&fetch, meta_.get() + fetch_bucket, sizeof(fetch_t));
-            }
+            memcpy(&fetch, meta_.get() + fetch_bucket, sizeof(fetch_t));
             // start_bit now indicates which bits of 'fetch' we need
             start_bit -= fetch_bucket * meta_t_bits;
             return (fetch >> start_bit) & extractor_mask;
@@ -108,44 +88,18 @@ public:
         if constexpr (div_clean) {
             const Index pos = bucket / items_per_fetch;
             const unsigned shift = meta_bits * (bucket & shift_mask);
-            if constexpr(concurrent) {
-                meta_t oldmeta, newmeta;
-                do {
-                    oldmeta = meta_[pos];
-                    newmeta = oldmeta & ~static_cast<meta_t>(extractor_mask << shift);
-                    newmeta |= (val << shift);
-                } while (!meta_[pos].compare_exchange_weak(oldmeta, newmeta));
-            } else {
-                meta_[pos] &= ~static_cast<meta_t>(extractor_mask << shift);
-                meta_[pos] |= (val << shift);
-            }
+            meta_[pos] &= ~static_cast<meta_t>(extractor_mask << shift);
+            meta_[pos] |= (val << shift);
         } else {
             // find the fetch position first
             Index start_bit = bucket * meta_bits;
             Index fetch_bucket = start_bit / meta_t_bits;
             // start_bit now indicates which bits of 'fetch' we need
             start_bit -= fetch_bucket * meta_t_bits;
-            if constexpr(concurrent) {
-                fetch_t fetch;
-                meta_t oldmeta1, oldmeta2;
-                do {
-                    oldmeta1 = meta_[fetch_bucket];
-                    oldmeta2 = meta_[fetch_bucket + 1];
-                    fetch = (fetch_t{oldmeta2} << meta_t_bits) | oldmeta1;
-                    fetch &= ~(extractor_mask << start_bit);
-                    fetch |= (val << start_bit);
-                    /* NOTE: GetMeta cannot be used concurrently (on the same bucket) as SetMeta
-                       because this updates the two parts independently. */
-                    /* FIXME: if one of these succeeds, that wouldn't need to be retried, but
-                       it might be wasted effort to try to optimize that. */
-                } while(!meta_[fetch_bucket].compare_exchange_weak(oldmeta1, static_cast<meta_t>(fetch)) ||
-                        !meta_[fetch_bucket + 1].compare_exchange_weak(oldmeta2, static_cast<meta_t>(fetch >> meta_t_bits)));
-            } else {
-                fetch_t* fetch =
-                    reinterpret_cast<fetch_t*>(meta_.get() + fetch_bucket);
-                *fetch &= ~(extractor_mask << start_bit);
-                *fetch |= (val << start_bit);
-            }
+            fetch_t* fetch =
+                reinterpret_cast<fetch_t*>(meta_.get() + fetch_bucket);
+            *fetch &= ~(extractor_mask << start_bit);
+            *fetch |= (val << start_bit);
         }
         assert(GetMeta(bucket) == val);
     }
@@ -176,15 +130,15 @@ protected:
     }
     // num_buckets_ is for debugging only & can be recomputed easily
     Index num_slots_ = 0, num_buckets_ = 0;
-    std::unique_ptr<std::conditional_t<concurrent, std::atomic<meta_t>, meta_t>[]> meta_;
+    std::unique_ptr<meta_t[]> meta_;
 };
 } // namespace
 
-template <typename Config, bool concurrent = false>
-class BasicStorage : public MetaStorage<Config, concurrent> {
+template <typename Config>
+class BasicStorage : public MetaStorage<Config> {
 public:
     IMPORT_RIBBON_CONFIG(Config);
-    using Super = MetaStorage<Config, concurrent>;
+    using Super = MetaStorage<Config>;
 
     BasicStorage() = default;
     explicit BasicStorage(Index num_slots) {
@@ -250,11 +204,11 @@ protected:
 };
 
 // only for backsubstition, can't be used for AddRange
-template <typename Config, bool concurrent = false>
-class InterleavedSolutionStorage : public MetaStorage<Config, concurrent> {
+template <typename Config>
+class InterleavedSolutionStorage : public MetaStorage<Config> {
 public:
     IMPORT_RIBBON_CONFIG(Config);
-    using Super = MetaStorage<Config, concurrent>;
+    using Super = MetaStorage<Config>;
 
     InterleavedSolutionStorage() = default;
 
@@ -303,9 +257,6 @@ protected:
 };
 
 
-/* FIXME: As far as I can tell, this is never used in the part of the algorithm that
-   needs to concurrently use SetMeta, so it doesn't really need to be made concurrent.
-   I need to verify that this is really true, though. */
 // For now, two-bit thresholds only
 template <typename Config>
 class CacheLineStorage {

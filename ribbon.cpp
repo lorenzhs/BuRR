@@ -44,7 +44,7 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads) {
     LOG1 << "Input generation took " << timer.ElapsedNanos(true) / 1e6 << "ms";
 
     ribbon_filter<depth, Config> rs(num_slots, slots_per_item, seed);
-    ribbon_filter<depth, Config, true> r(num_slots, slots_per_item, seed);
+    ribbon_filter<depth, Config> r(num_slots, slots_per_item, seed);
 
     LOG1 << "Allocation took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
 
