@@ -34,6 +34,8 @@ public:
                               items_per_fetch = fetch_bits / meta_bits;
     static constexpr fetch_t extractor_mask = (fetch_t{1} << meta_bits) - 1;
     static constexpr Index shift_mask = items_per_fetch - 1;
+    /* sanity check to make sure the concurrent usage is safe */
+    static_assert(sizeof(fetch_t) <= 2 * sizeof(meta_t));
 
 
     void Prepare(size_t num_slots) {
@@ -56,6 +58,61 @@ public:
     }
     void Reset() {
         meta_.reset();
+    }
+
+    /* Return the first bucket after 'start' that can be safely read/written
+       without the possibility of a read/write of a bucket before 'start'
+       interfering with it. */
+    Index GetNextSafeStart(Index start) {
+        if constexpr (div_clean) {
+            if (start % items_per_fetch != 0) {
+                start += items_per_fetch - (start % items_per_fetch);
+            }
+        } else {
+            Index start_bit = start * meta_bits;
+            /* GetMeta/SetMeta always read/write two entries in meta_,
+               so if another bucket metadata starts before 'start' in
+               the same meta_ entry, we need to skip over this meta_
+               entry *and* the next one. If no other bucket metadata
+               can start before this one in the same meta_ entry, we
+               only need to skip over one meta_ entry. */
+            if (start_bit % meta_t_bits >= meta_bits) {
+                start_bit += 2 * meta_t_bits;
+            } else {
+                start_bit += meta_t_bits;
+            }
+            /* find first bucket that starts in this meta_ entry */
+            start_bit -= (start_bit % meta_t_bits);
+            start = (start_bit + meta_bits - 1) / meta_bits;
+        }
+        return start;
+    }
+
+    /* Return the last bucket before 'end' that can be safely read/written
+       without the possibility of a read/write of a bucket after 'end'
+       interfering with it. */
+    Index GetPrevSafeEnd(Index end) {
+        assert(num_buckets_ > 0);
+        if (end >= num_buckets_ - 1)
+            return num_buckets_ - 1;
+        if constexpr (div_clean) {
+            if (end % items_per_fetch != items_per_fetch - 1) {
+                end -= (end % items_per_fetch) + 1;
+            }
+        } else {
+            Index end_bit = end * meta_bits + meta_bits - 1;
+            /* If the metadata is at the very end of a meta_ entry,
+               we just need to jump back one entry, otherwise two. */
+            if (end_bit % meta_t_bits == meta_t_bits - 1) {
+                end_bit -= meta_t_bits;
+            } else {
+                end_bit -= 2 * meta_t_bits;
+            }
+            /* find last bucket that starts in this meta_ entry */
+            end_bit += meta_t_bits - (end_bit % meta_t_bits) - 1;
+            end = end_bit / meta_bits;
+        }
+        return end;
     }
 
     inline void PrefetchMeta(Index bucket) const {

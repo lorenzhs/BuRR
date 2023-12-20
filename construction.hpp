@@ -365,6 +365,12 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     if (begin == end)
         return true;
 
+    if (!bump_vec) {
+        LOGC(log) << "bump_vec cannot be null when using the parallel version of AddRange, "
+                  << "falling back to sequential version";
+        return BandingAddRange(bs, hasher, begin, end, bump_vec);
+    }
+
     rocksdb::StopWatchNano timer(true);
     const Index num_starts = bs->GetNumStarts();
     const Index num_buckets = bs->GetNumBuckets();
@@ -442,18 +448,15 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
        we don't need to use SetCoeffs when bumping these buckets, right? */
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
-    /* FIXME: this is probably not needed, see comment above
-      bump_vec == nullptr */
-    std::vector<char> thread_ret(num_threads);
     /* FIXME: sensible reserve() for these */
     std::vector<BumpStorage> thread_bump_vecs(num_threads);
-    /* FIXME: make hasher.Set and bs->SetMeta concurrent to remove these mutexes */
+    /* FIXME: make hasher.Set concurrent to remove this mutex */
     [[maybe_unused]] std::conditional_t<oneBitThresh, std::mutex, int> hash_mtx;
-    std::mutex meta_mtx;
+    std::vector<std::mutex> border_mutexes(num_threads - 1);
     for (std::size_t ti = 0; ti < num_threads; ++ti) {
         threads.emplace_back([&, ti]() {
             Index start_bucket = ti * buckets_per_thread;
-            /* last bucket has been bumped (except for last thread) */
+            /* last bucket is bumped (except for last thread) */
             Index end_bucket = ti == num_threads - 1 ?
                                num_buckets - 1 :
                                start_bucket + buckets_per_thread - 2;
@@ -466,45 +469,15 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                 return v < Hasher::GetBucket(std::get<0>(e));
             });
             if (start_it == input.get() + num_items) {
-                thread_ret[ti] = 1;
                 return;
             }
             Index start_index = start_it - input.get();
             Index end_index = end_it - input.get();
-
-            /* bump all items in last bucket of range */
-            if (ti != num_threads - 1) {
-                Index bucket = end_bucket + 1;
-                /* FIXME: it might be better to just have a function AllBumpThresh()
-                   (like NoBumpThresh()) to get the proper threshold */
-                if (end_index < num_items) {
-                    Index val = Hasher::GetIntraBucket(std::get<0>(input[end_index]));
-                    Index cval = hasher.Compress(val);
-                    if constexpr (oneBitThresh) {
-                        if (cval == 2) {
-                            {
-                                std::scoped_lock lock(hash_mtx);
-                                hasher.Set(bucket, val);
-                            }
-                            {
-                                std::scoped_lock lock(meta_mtx);
-                                bs->SetMeta(bucket, 0);
-                            }
-                        } else {
-                            std::scoped_lock lock(meta_mtx);
-                            bs->SetMeta(bucket, cval);
-                        }
-                    } else {
-                        std::scoped_lock lock(meta_mtx);
-                        bs->SetMeta(bucket, cval);
-                    }
-                }
-                for (Index i = end_index; i < static_cast<Index>(num_items); ++i) {
-                    if (bucket != Hasher::GetBucket(std::get<0>(input[i])))
-                        break;
-                    thread_bump_vecs[ti].push_back(*(begin + std::get<1>(input[i])));
-                }
-            }
+            Index safe_start_bucket = bs->GetNextSafeStart(start_bucket);
+            /* safe_end_bucket should be calculated with actual end bucket,
+               including the bumped bucket
+               GetPrevSafeEnd just returns num_buckets - 1 if the input is >= that */
+            Index safe_end_bucket = bs->GetPrevSafeEnd(start_bucket + buckets_per_thread - 1);
 
             Index last_bucket = start_bucket;
             bool all_good = true;
@@ -517,6 +490,12 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
             // "plus" case with a separately stored threshold
             [[maybe_unused]] Index last_val = -1;
             [[maybe_unused]] std::conditional_t<oneBitThresh, decltype(bump_cache), int> unc_bump_cache;
+            bool start_locked = false;
+            bool end_locked = false;
+            if (ti > 0) {
+                border_mutexes[ti - 1].lock();
+                start_locked = true;
+            }
 
 #ifndef RIBBON_PASS_HASH
             auto next = *(begin + input[start_index].second);
@@ -549,13 +528,20 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                 if (bucket != last_bucket) {
                     // moving to next bucket
                     sLOG << "Moving to bucket" << bucket << "was" << last_bucket;
+                    if (ti > 0 && last_bucket < safe_start_bucket && bucket >= safe_start_bucket) {
+                        border_mutexes[ti - 1].unlock();
+                        start_locked = false;
+                    }
+                    if (ti < num_threads - 1 && last_bucket <= safe_end_bucket && bucket > safe_end_bucket) {
+                        border_mutexes[ti].lock();
+                        end_locked = true;
+                    }
                     if constexpr (oneBitThresh) {
                         unc_bump_cache.clear();
                         last_val = val;
                     }
                     if (thresh == Hasher::NoBumpThresh()) {
                         sLOG << "Bucket" << last_bucket << "has no bumped items";
-                        std::scoped_lock lock(meta_mtx);
                         bs->SetMeta(last_bucket, thresh);
                     }
                     all_good = true;
@@ -599,13 +585,6 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                 auto [success, row] = BandingAdd<kFCA1>(bs, start, cr, rr);
                 if (!success) {
                     assert(all_good);
-                    /* FIXME: this doesn't really make sense in the parallel case
-                       because it requires bumping to work */
-                    if (bump_vec == nullptr) {
-                        // bumping disabled, abort!
-                        thread_ret[ti] = 0;
-                        return;
-                    }
                     // if we got this far, this is the first failure in this bucket,
                     // and we need to undo insertions with the same cval
                     sLOG << "First failure in bucket" << bucket << "val" << val
@@ -626,10 +605,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                             // Set meta to 0 (some bumpage) but keep thresh at 2 so that
                             // we don't retroactively bump everything when moving to the
                             // next bucket
-                            {
-                                std::scoped_lock lock(meta_mtx);
-                                bs->SetMeta(bucket, 0);
-                            }
+                            bs->SetMeta(bucket, 0);
                             all_good = false;
 
                             // bump all items with the same uncompressed value
@@ -642,10 +618,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                             continue;
                         }
                     }
-                    {
-                        std::scoped_lock lock(meta_mtx);
-                        bs->SetMeta(bucket, thresh);
-                    }
+                    bs->SetMeta(bucket, thresh);
                     all_good = false;
 
                     do_bump(thread_bump_vecs[ti], bump_cache);
@@ -665,10 +638,47 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
             }
             // set final threshold
             if (thresh == Hasher::NoBumpThresh()) {
-                std::scoped_lock lock(meta_mtx);
                 bs->SetMeta(last_bucket, thresh);
             }
-            thread_ret[ti] = 1;
+
+            /* bump all items in last bucket of range */
+            if (ti != num_threads - 1) {
+                if (!end_locked) {
+                    border_mutexes[ti].lock();
+                    end_locked = true;
+                }
+                Index bucket = end_bucket + 1;
+                /* FIXME: it might be better to just have a function AllBumpThresh()
+                   (like NoBumpThresh()) to get the proper threshold */
+                if (end_index < num_items) {
+                    Index val = Hasher::GetIntraBucket(std::get<0>(input[end_index]));
+                    Index cval = hasher.Compress(val);
+                    if constexpr (oneBitThresh) {
+                        if (cval == 2) {
+                            {
+                                std::scoped_lock lock(hash_mtx);
+                                hasher.Set(bucket, val);
+                            }
+                            bs->SetMeta(bucket, 0);
+                        } else {
+                            bs->SetMeta(bucket, cval);
+                        }
+                    } else {
+                        bs->SetMeta(bucket, cval);
+                    }
+                }
+                for (Index i = end_index; i < static_cast<Index>(num_items); ++i) {
+                    if (bucket != Hasher::GetBucket(std::get<0>(input[i])))
+                        break;
+                    thread_bump_vecs[ti].push_back(*(begin + std::get<1>(input[i])));
+                }
+            }
+            if (end_locked) {
+                border_mutexes[ti].unlock();
+            }
+            if (start_locked) {
+                border_mutexes[ti].unlock();
+            }
         });
     }
     for (auto& thread : threads) {
