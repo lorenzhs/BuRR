@@ -449,6 +449,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     /* FIXME: sensible reserve() for these */
+    /* FIXME: avoid false cache sharing through push_back on these vectors */
     std::vector<BumpStorage> thread_bump_vecs(num_threads);
     /* FIXME: make hasher.Set concurrent to remove this mutex */
     [[maybe_unused]] std::conditional_t<oneBitThresh, std::mutex, int> hash_mtx;
@@ -684,15 +685,30 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     for (auto& thread : threads) {
         thread.join();
     }
-    /* NOTE: in the end, sizes of all bump vectors are known, so we could manually manipulate the
-       original bump vector by resizing it and then copying the individual bump vecs in parallel */
-    std::size_t total_size = 0;
-    for (auto& v : thread_bump_vecs) {
-        total_size += v.size();
+    /* FIXME: It would be ideal to have this copying as part of the parallel processing
+       above (only protect the resizing of bump_vec, but not the copying), but that's
+       problematic because the total size of bump_vec is not known before, so it might
+       happen that the internal storage is reallocated while a different thread is
+       copying to that storage, leading to undefined behavior. At least I think that
+       would be problematic, but I need to think about it a bit more. */
+    std::vector<std::size_t> start_pos(num_threads);
+    start_pos[0] = bump_vec->size();
+    for (std::size_t i = 0; i < num_threads - 1; ++i) {
+        start_pos[i + 1] = start_pos[i] + thread_bump_vecs[i].size();
     }
-    bump_vec->reserve(bump_vec->size() + total_size);
-    for (auto& v : thread_bump_vecs) {
-        bump_vec->insert(bump_vec->end(), v.begin(), v.end());
+    bump_vec->resize(start_pos[num_threads - 1] + thread_bump_vecs[num_threads - 1].size());
+    threads.clear();
+    for (std::size_t ti = 0; ti < num_threads; ++ti) {
+        threads.emplace_back([&, ti]() {
+            std::copy(
+                thread_bump_vecs[ti].begin(),
+                thread_bump_vecs[ti].end(),
+                bump_vec->begin() + start_pos[ti]
+            );
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
     }
 
     // migrate thresholds to hash table
