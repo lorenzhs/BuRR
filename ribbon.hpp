@@ -174,16 +174,20 @@ public:
         return success;
     }
 
-    void BackSubst() {
+    void BackSubst(std::size_t num_threads = 0) {
         if (storage_.GetNumSlots() == 0)
             return;
         rocksdb::StopWatchNano timer(true);
         if constexpr (kUseInterleavedSol) {
+            if (num_threads != 0)
+                abort(); /* not implemented yet */
             InterleavedBackSubst(storage_, &sol_);
             // move metadata by swapping pointers
             sol_.MoveMetadata(&storage_);
             storage_.Reset();
         } else if constexpr (kUseCacheLineStorage) {
+            if (num_threads != 0)
+                abort(); /* not implemented yet */
             sol_.Prepare(storage_.GetNumSlots());
             SimpleBackSubst(storage_, &sol_);
             // copy metadata one-by-one
@@ -192,7 +196,10 @@ public:
             }
             storage_.Reset();
         } else {
-            SimpleBackSubst(storage_, &storage_);
+            if (num_threads == 0)
+                SimpleBackSubst(storage_, &storage_);
+            else
+                SimpleBackSubstParallel(storage_, &storage_, num_threads);
         }
 
         LOGC(Config::log) << "Backsubstitution for " << storage_.GetNumSlots()
@@ -418,9 +425,9 @@ public:
         return AddRangeMHCInternal(input.get(), input.get() + (end - begin));
     }
 
-    void BackSubst() {
-        Super::BackSubst();
-        child_ribbon_.BackSubst();
+    void BackSubst(std::size_t num_threads = 0) {
+        Super::BackSubst(num_threads);
+        child_ribbon_.BackSubst(num_threads);
     }
 
     inline bool QueryFilter(const Key &key) const {
@@ -608,6 +615,13 @@ public:
         auto [was_bumped, result] = Super::QueryRetrievalMHC(mhc);
         assert(!was_bumped);
         return result;
+    }
+
+    void BackSubst(std::size_t num_threads = 0) {
+        (void)num_threads;
+        /* the base case ribbon doesn't use any bumping, so the
+           sequential version of back substitution must be used */
+        Super::BackSubst(0);
     }
 
 

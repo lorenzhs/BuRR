@@ -20,6 +20,8 @@
 #include <ios>
 #endif
 
+#include <thread>
+
 namespace ribbon {
 
 template <typename BandingStorage, typename SolutionStorage>
@@ -67,6 +69,94 @@ void SimpleBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
             sr |= (bit ? ResultRow{1} : ResultRow{0}) << j;
         }
         sol->SetResult(i, sr);
+    }
+
+#ifdef RIBBON_DUMP
+    sLOG1 << num_slots << "slots";
+    for (Index i = 0; i < num_slots; i++) {
+        const ResultRow r = sol->GetResult(i);
+        LOG1 << "Row " << std::setw(2) << i << " = " << std::hex << std::setw(2)
+             << (uint64_t)r << std::dec << " = "
+             << std::bitset<sizeof(ResultRow) * 8u>(r).to_string();
+    }
+#endif
+}
+
+/* NOTE: It is crucial that this is not called by the base case ribbon
+   since that does not support bumping */
+template <typename BandingStorage, typename SolutionStorage>
+void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std::size_t num_threads) {
+    using CoeffRow = typename BandingStorage::CoeffRow;
+    using Index = typename BandingStorage::Index;
+    // use uint32_t instead of uint16_t because gcc is bad with uint16_t
+    using ResultRow = make_fast_t<typename BandingStorage::ResultRow>;
+
+    constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U);
+    constexpr auto kResultBits = static_cast<Index>(sizeof(ResultRow) * 8U);
+
+    const Index num_starts = bs.GetNumStarts();
+    const Index num_buckets = bs.GetNumBuckets();
+    /* NOTE: It is crucial that this is calculated the same as in BandingAddParallel
+       so there are no conflicts. */
+    std::size_t buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
+    /* FIXME: determine at what point it makes more sense to just use the sequential version */
+    /* NOTE: this must match BandingAddParallel so we know that there
+       actually are gaps in the right place */
+    if (buckets_per_thread < 2) {
+        SimpleBackSubst(bs, sol);
+        return;
+    }
+    // sss->PrepareForNumStarts(num_starts);
+    const Index num_slots = num_starts + kCoeffBits - 1;
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (std::size_t ti = 0; ti < num_threads; ++ti) {
+        threads.emplace_back([&, ti]() {
+            // A column-major buffer of the solution matrix, containing enough
+            // recently-computed solution data to compute the next solution row
+            // (based also on banding data).
+            std::array<CoeffRow, kResultBits> state;
+            state.fill(0);
+
+            Index start_bucket = ti * buckets_per_thread;
+            Index end_bucket = start_bucket + buckets_per_thread;
+            Index start_slot = start_bucket * BandingStorage::kBucketSize;
+            /* NOTE: For the last thread, end_bucket * kBucketSize may actually be less than num_slots */
+            Index end_slot = ti == num_threads - 1 ? num_slots : end_bucket * BandingStorage::kBucketSize;
+            if (end_slot > num_slots)
+                end_slot = num_slots;
+            for (Index i = end_slot; i > start_slot;) {
+                --i;
+                CoeffRow cr = bs.GetCoeffs(i);
+                ResultRow rr = bs.GetResult(i);
+                // solution row
+                ResultRow sr = 0;
+                for (Index j = 0; j < kResultBits; ++j) {
+                    // Compute next solution bit at row i, column j (see derivation below)
+                    CoeffRow tmp = state[j] << 1;
+                    bool bit = (rocksdb::BitParity(tmp & cr) ^ ((rr >> j) & 1)) != 0;
+                    tmp |= bit ? CoeffRow{1} : CoeffRow{0};
+
+                    // Now tmp is solution at column j from row i for next kCoeffBits
+                    // more rows. Thus, for valid solution, the dot product of the
+                    // solution column with the coefficient row has to equal the result
+                    // at that column,
+                    //   BitParity(tmp & cr) == ((rr >> j) & 1)
+
+                    // Update state.
+                    state[j] = tmp;
+                    // add to solution row
+                    sr |= (bit ? ResultRow{1} : ResultRow{0}) << j;
+                }
+                /* WARNING: This assumes that SetResult can be safely called
+                   without synchronization (this is the case for BasicStorage). */
+                sol->SetResult(i, sr);
+            }
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
     }
 
 #ifdef RIBBON_DUMP

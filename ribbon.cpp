@@ -58,8 +58,11 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads) {
 
     input.reset();
 
-    r.BackSubst();
-    LOG1 << "Backsubstitution took " << timer.ElapsedNanos(true) / 1e6
+    rs.BackSubst();
+    LOG1 << "Backsubstitution (seq) took " << timer.ElapsedNanos(true) / 1e6
+         << "ms in total\n";
+    r.BackSubst(std::thread::hardware_concurrency());
+    LOG1 << "Backsubstitution (par) took " << timer.ElapsedNanos(true) / 1e6
          << "ms in total\n";
 
     const size_t bytes = r.Size();
