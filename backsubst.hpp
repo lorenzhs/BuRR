@@ -20,6 +20,7 @@
 #include <ios>
 #endif
 
+#include <mutex>
 #include <thread>
 
 namespace ribbon {
@@ -111,6 +112,7 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
 
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
+    [[maybe_unused]] std::conditional_t<BandingStorage::kUseCacheLineStorage, std::vector<std::mutex>, std::size_t> mutexes(num_threads - 1);
     for (std::size_t ti = 0; ti < num_threads; ++ti) {
         threads.emplace_back([&, ti]() {
             // A column-major buffer of the solution matrix, containing enough
@@ -126,6 +128,20 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
             Index end_slot = ti == num_threads - 1 ? num_slots : end_bucket * BandingStorage::kBucketSize;
             if (end_slot > num_slots)
                 end_slot = num_slots;
+            [[maybe_unused]] Index safe_end = 0;
+            [[maybe_unused]] Index safe_start = 0;
+            if constexpr (BandingStorage::kUseCacheLineStorage) {
+                safe_end = sol->GetPrevSafeRowEnd(end_slot - 1);
+                safe_start = sol->GetNextSafeRowStart(start_slot);
+            }
+            [[maybe_unused]] bool start_locked = false;
+            [[maybe_unused]] bool end_locked = false;
+            if constexpr (BandingStorage::kUseCacheLineStorage) {
+                if (ti < num_threads - 1) {
+                    mutexes[ti].lock();
+                    end_locked = true;
+                }
+            }
             for (Index i = end_slot; i > start_slot;) {
                 --i;
                 CoeffRow cr = bs.GetCoeffs(i);
@@ -149,9 +165,23 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
                     // add to solution row
                     sr |= (bit ? ResultRow{1} : ResultRow{0}) << j;
                 }
-                /* WARNING: This assumes that SetResult can be safely called
-                   without synchronization (this is the case for BasicStorage). */
+                if constexpr (BandingStorage::kUseCacheLineStorage) {
+                    if (ti > 0 && !start_locked && i < safe_start) {
+                        mutexes[ti - 1].lock();
+                        start_locked = true;
+                    }
+                    if (ti < num_threads - 1 && end_locked && i <= safe_end) {
+                        mutexes[ti].unlock();
+                        end_locked = false;
+                    }
+                }
                 sol->SetResult(i, sr);
+            }
+            if constexpr (BandingStorage::kUseCacheLineStorage) {
+                if (start_locked)
+                    mutexes[ti - 1].unlock();
+                if (end_locked)
+                    mutexes[ti].unlock();
             }
         });
     }

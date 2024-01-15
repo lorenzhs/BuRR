@@ -186,10 +186,12 @@ public:
             sol_.MoveMetadata(&storage_);
             storage_.Reset();
         } else if constexpr (kUseCacheLineStorage) {
-            if (num_threads != 0)
-                abort(); /* not implemented yet */
             sol_.Prepare(storage_.GetNumSlots());
-            SimpleBackSubst(storage_, &sol_);
+            if (num_threads == 0)
+                SimpleBackSubst(storage_, &sol_);
+            else
+                SimpleBackSubstParallel(storage_, &sol_, num_threads);
+            /* FIXME: parallize setting the metadata */
             // copy metadata one-by-one
             for (Index bucket = 0; bucket < storage_.GetNumBuckets(); ++bucket) {
                 sol_.SetMeta(bucket, storage_.GetMeta(bucket));

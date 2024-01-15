@@ -60,6 +60,8 @@ public:
         meta_.reset();
     }
 
+    /* FIXME: document that this is not clamped, i.e. should not be used by first/last thread */
+       /* (or maybe just change that?) */
     /* Return the first bucket after 'start' that can be safely read/written
        without the possibility of a read/write of a bucket before 'start'
        interfering with it. */
@@ -513,6 +515,19 @@ public:
             return new_row;
         else
             return std::make_pair(new_row, 0);
+    }
+
+    /* FIXME: I'm not sure if this is correct yet, and it could
+       be improved in some cases when a row has one of its ends
+       exactly at a byte boundary */
+    inline Index GetPrevSafeRowEnd(Index row) {
+        Index offset = 8u / kResultBits + 1;
+        return row > offset ? row - offset : 0;
+    }
+
+    inline Index GetNextSafeRowStart(Index row) {
+        Index offset = 8u / kResultBits + 1;
+        return row + offset;
     }
 
     inline void SetResult(Index row, ResultRow val) {

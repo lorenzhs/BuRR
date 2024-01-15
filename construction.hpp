@@ -678,7 +678,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                 border_mutexes[ti].unlock();
             }
             if (start_locked) {
-                border_mutexes[ti].unlock();
+                border_mutexes[ti - 1].unlock();
             }
         });
     }
