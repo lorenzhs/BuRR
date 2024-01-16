@@ -179,9 +179,10 @@ public:
             return;
         rocksdb::StopWatchNano timer(true);
         if constexpr (kUseInterleavedSol) {
-            if (num_threads != 0)
-                abort(); /* not implemented yet */
-            InterleavedBackSubst(storage_, &sol_);
+            if (num_threads == 0)
+                InterleavedBackSubst(storage_, &sol_);
+            else
+                InterleavedBackSubstParallel(storage_, &sol_, num_threads);
             // move metadata by swapping pointers
             sol_.MoveMetadata(&storage_);
             storage_.Reset();

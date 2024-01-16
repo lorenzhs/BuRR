@@ -299,4 +299,100 @@ void InterleavedBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
 #endif
 }
 
+template <typename BandingStorage, typename SolutionStorage>
+void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std::size_t num_threads) {
+    using CoeffRow = typename BandingStorage::CoeffRow;
+    using Index = typename BandingStorage::Index;
+
+    static_assert(sizeof(Index) == sizeof(typename SolutionStorage::Index),
+                  "must be same");
+    static_assert(sizeof(CoeffRow) == sizeof(typename SolutionStorage::CoeffRow),
+                  "must be same");
+
+    constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U),
+                   kResultBits = SolutionStorage::kResultBits;
+
+    constexpr bool debug = false;
+    const Index num_slots = bs.GetNumSlots();
+    // num_slots *MUST* be a multiple of kCoeffBits
+    assert(num_slots >= kCoeffBits && num_slots % kCoeffBits == 0);
+    sol->Prepare(num_slots);
+
+    const Index num_blocks = sol->GetNumBlocks();
+    const Index num_segments = sol->GetNumSegments();
+
+    // We should be utilizing all available segments
+    assert(num_segments == num_blocks * kResultBits);
+
+    sLOG << "Backsubstitution: have" << num_blocks << "blocks," << num_segments
+         << "segments for" << num_slots << "slots, kResultBits=" << kResultBits;
+
+    const Index num_buckets = bs.GetNumBuckets();
+    /* NOTE: It is crucial that this is calculated the same as in BandingAddParallel
+       so there are no conflicts. */
+    std::size_t buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
+    /* NOTE: this must match BandingAddParallel so we know that there
+       actually are gaps in the right place */
+    if (buckets_per_thread < 2) {
+        InterleavedBackSubst(bs, sol);
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    for (std::size_t ti = 0; ti < num_threads; ++ti) {
+        threads.emplace_back([&, ti]() {
+            // TODO: consider fixed-column specializations with stack-allocated state
+
+            // A column-major buffer of the solution matrix, containing enough
+            // recently-computed solution data to compute the next solution row
+            // (based also on banding data).
+            std::unique_ptr<CoeffRow[]> state{new CoeffRow[kResultBits]()};
+
+            Index start_bucket = ti * buckets_per_thread;
+            Index end_bucket = start_bucket + buckets_per_thread;
+            Index start_slot = start_bucket * BandingStorage::kBucketSize;
+            /* NOTE: For the last thread, end_bucket * kBucketSize may actually be less than num_slots */
+            Index end_slot = ti == num_threads - 1 ? num_slots : end_bucket * BandingStorage::kBucketSize;
+            if (end_slot > num_slots)
+                end_slot = num_slots;
+
+            /* There are at least kCoeffBits rows of zero due to the bumping of a
+               bucket between two threads, so we just round down here */
+            Index start_block = start_slot / kCoeffBits;
+            Index block = ti == num_threads - 1 ? num_blocks : end_slot / kCoeffBits;
+            Index segment = block * kResultBits;
+            while (block > start_block) {
+                --block;
+                /* FIXME: this debug statement won't work properly
+                   when running this in parallel */
+                sLOG << "Backsubstituting block" << block << "segment" << segment;
+                BackSubstBlock(state.get(), kResultBits, bs, block * kCoeffBits);
+                segment -= kResultBits;
+                for (Index i = 0; i < kResultBits; ++i) {
+                    sol->SetSegment(segment + i, state[i]);
+                }
+            }
+            assert(segment == start_block * kResultBits);
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+
+
+#ifdef RIBBON_DUMP
+    sLOG1 << sol->GetNumSegments() << "segments in" << sol->GetNumBlocks()
+          << "blocks";
+    for (Index i = 0; i < sol->GetNumSegments(); i++) {
+        if (i % (sol->GetNumSegments() / sol->GetNumBlocks()) == 0)
+            LOG1 << "================================";
+        const CoeffRow seg = sol->GetSegment(i);
+        LOG1 << "Seg " << std::setw(2) << i << " = " << std::hex << std::setw(4)
+             << (uint64_t)seg << std::dec << " = "
+             << std::bitset<sizeof(CoeffRow) * 8u>(seg).to_string();
+    }
+#endif
+}
+
 } // namespace ribbon
