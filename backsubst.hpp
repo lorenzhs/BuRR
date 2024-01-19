@@ -100,7 +100,6 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
     /* NOTE: It is crucial that this is calculated the same as in BandingAddParallel
        so there are no conflicts. */
     std::size_t buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
-    /* FIXME: determine at what point it makes more sense to just use the sequential version */
     /* NOTE: this must match BandingAddParallel so we know that there
        actually are gaps in the right place */
     if (buckets_per_thread < 2) {
@@ -122,12 +121,13 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
             state.fill(0);
 
             Index start_bucket = ti * buckets_per_thread;
+            /* deal with cases where some threads don't get any elements */
+            if (start_bucket >= num_buckets)
+                return;
             Index end_bucket = start_bucket + buckets_per_thread;
             Index start_slot = start_bucket * BandingStorage::kBucketSize;
             /* NOTE: For the last thread, end_bucket * kBucketSize may actually be less than num_slots */
-            Index end_slot = ti == num_threads - 1 ? num_slots : end_bucket * BandingStorage::kBucketSize;
-            if (end_slot > num_slots)
-                end_slot = num_slots;
+            Index end_slot = end_bucket >= num_buckets ? num_slots : end_bucket * BandingStorage::kBucketSize;
             [[maybe_unused]] Index safe_end = 0;
             [[maybe_unused]] Index safe_start = 0;
             if constexpr (BandingStorage::kUseCacheLineStorage) {
@@ -350,17 +350,18 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
             std::unique_ptr<CoeffRow[]> state{new CoeffRow[kResultBits]()};
 
             Index start_bucket = ti * buckets_per_thread;
+            /* deal with cases where some threads don't get any elements */
+            if (start_bucket >= num_buckets)
+                return;
             Index end_bucket = start_bucket + buckets_per_thread;
             Index start_slot = start_bucket * BandingStorage::kBucketSize;
             /* NOTE: For the last thread, end_bucket * kBucketSize may actually be less than num_slots */
-            Index end_slot = ti == num_threads - 1 ? num_slots : end_bucket * BandingStorage::kBucketSize;
-            if (end_slot > num_slots)
-                end_slot = num_slots;
+            Index end_slot = end_bucket >= num_buckets ? num_slots : end_bucket * BandingStorage::kBucketSize;
 
             /* There are at least kCoeffBits rows of zero due to the bumping of a
                bucket between two threads, so we just round down here */
             Index start_block = start_slot / kCoeffBits;
-            Index block = ti == num_threads - 1 ? num_blocks : end_slot / kCoeffBits;
+            Index block = end_slot / kCoeffBits;
             Index segment = block * kResultBits;
             while (block > start_block) {
                 --block;

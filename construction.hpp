@@ -365,18 +365,14 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     if (begin == end)
         return true;
 
-    if (!bump_vec) {
-        LOGC(log) << "bump_vec cannot be null when using the parallel version of AddRange, "
-                  << "falling back to sequential version";
+    if (!bump_vec)
         return BandingAddRange(bs, hasher, begin, end, bump_vec);
-    }
 
     rocksdb::StopWatchNano timer(true);
     const Index num_starts = bs->GetNumStarts();
     const Index num_buckets = bs->GetNumBuckets();
 
     std::size_t buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
-    /* FIXME: test what value is best here (2 is minimum for parallel version to work) */
     if (buckets_per_thread < 2)
         return BandingAddRange(bs, hasher, begin, end, bump_vec);
 
@@ -444,8 +440,6 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
 
     /* FIXME: use sensible reserve() for bump_vec since more items
        are being bumped now */
-    /* FIXME: all coeffs in bandingstorage are initially 0, so
-       we don't need to use SetCoeffs when bumping these buckets, right? */
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     /* FIXME: sensible reserve() for these */
@@ -457,10 +451,14 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     for (std::size_t ti = 0; ti < num_threads; ++ti) {
         threads.emplace_back([&, ti]() {
             Index start_bucket = ti * buckets_per_thread;
+            if (start_bucket >= num_buckets)
+                return;
             /* last bucket is bumped (except for last thread) */
-            Index end_bucket = ti == num_threads - 1 ?
-                               num_buckets - 1 :
-                               start_bucket + buckets_per_thread - 2;
+            Index end_bucket = start_bucket + buckets_per_thread;
+            if (end_bucket >= num_buckets)
+                end_bucket = num_buckets - 1;
+            else
+                end_bucket -= 2;
             auto start_it = std::lower_bound(
                 input.get(), input.get() + num_items, start_bucket, [](const auto& e, auto v) {
                 return Hasher::GetBucket(std::get<0>(e)) < v;
