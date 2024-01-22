@@ -436,7 +436,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     }
     LOGC(log) << "\tInput transformation took "
               << timer.ElapsedNanos(true) / 1e6 << "ms";
-    my_sort_parallel(input.get(), input.get() + num_items, num_threads);
+    my_sort_parallel(input.get(), input.get() + num_items, orig_num_threads);
     LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
 
     const auto do_bump = [&](auto &thread_bump_vec, auto &vec) {
