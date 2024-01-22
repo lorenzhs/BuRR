@@ -22,6 +22,7 @@
 
 #include <mutex>
 #include <thread>
+#include <iostream>
 
 namespace ribbon {
 
@@ -94,24 +95,32 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
 
     constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U);
     constexpr auto kResultBits = static_cast<Index>(sizeof(ResultRow) * 8U);
+    constexpr Index kMinBucketsPerThread = BandingStorage::kMinBucketsPerThread;
 
     const Index num_starts = bs.GetNumStarts();
     const Index num_buckets = bs.GetNumBuckets();
+
     /* NOTE: It is crucial that this is calculated the same as in BandingAddParallel
        so there are no conflicts. */
-    std::size_t buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
-    /* NOTE: this must match BandingAddParallel so we know that there
-       actually are gaps in the right place */
-    if (buckets_per_thread < 2) {
-        SimpleBackSubst(bs, sol);
-        return;
+    std::size_t buckets_per_thread = num_buckets / num_threads;
+    if (buckets_per_thread < kMinBucketsPerThread) {
+        std::size_t orig_num_threads = num_threads;
+        num_threads = num_buckets / kMinBucketsPerThread;
+        assert(num_threads < orig_num_threads);
+        if (num_threads <= 1) {
+            SimpleBackSubst(bs, sol);
+            return;
+        }
     }
+    buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
+
     // sss->PrepareForNumStarts(num_starts);
     const Index num_slots = num_starts + kCoeffBits - 1;
 
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     [[maybe_unused]] std::conditional_t<BandingStorage::kUseCacheLineStorage, std::vector<std::mutex>, std::size_t> mutexes(num_threads - 1);
+    std::mutex output_mutex;
     for (std::size_t ti = 0; ti < num_threads; ++ti) {
         threads.emplace_back([&, ti]() {
             // A column-major buffer of the solution matrix, containing enough
@@ -141,6 +150,24 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
                     mutexes[ti].lock();
                     end_locked = true;
                 }
+            }
+            /* if this isn't the last thread, check if the necessary amount
+               of empty rows is present for parallel processing to work
+               (if the back substitution is called with the same amount of
+               threads as the insertion, this should always be the case) */
+            if (end_bucket < num_buckets) {
+                for (Index i = end_slot; i > end_slot - kCoeffBits;) {
+                    --i;
+                    CoeffRow cr = bs.GetCoeffs(i);
+                    if (cr != 0) {
+                        std::scoped_lock lk(output_mutex);
+                        std::cerr << "ERROR: Thread " << ti << " found non-zero " <<
+                                     "coefficient row in back substitution!\n";
+                        /* FIXME: better error handling? */
+                        abort();
+                    }
+                }
+                end_slot -= kCoeffBits;
             }
             for (Index i = end_slot; i > start_slot;) {
                 --i;
@@ -311,6 +338,7 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
 
     constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U),
                    kResultBits = SolutionStorage::kResultBits;
+    constexpr Index kMinBucketsPerThread = BandingStorage::kMinBucketsPerThread;
 
     constexpr bool debug = false;
     const Index num_slots = bs.GetNumSlots();
@@ -330,16 +358,21 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
     const Index num_buckets = bs.GetNumBuckets();
     /* NOTE: It is crucial that this is calculated the same as in BandingAddParallel
        so there are no conflicts. */
-    std::size_t buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
-    /* NOTE: this must match BandingAddParallel so we know that there
-       actually are gaps in the right place */
-    if (buckets_per_thread < 2) {
-        InterleavedBackSubst(bs, sol);
-        return;
+    std::size_t buckets_per_thread = num_buckets / num_threads;
+    if (buckets_per_thread < kMinBucketsPerThread) {
+        std::size_t orig_num_threads = num_threads;
+        num_threads = num_buckets / kMinBucketsPerThread;
+        assert(num_threads < orig_num_threads);
+        if (num_threads <= 1) {
+            InterleavedBackSubst(bs, sol);
+            return;
+        }
     }
+    buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
 
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
+    std::mutex output_mutex;
     for (std::size_t ti = 0; ti < num_threads; ++ti) {
         threads.emplace_back([&, ti]() {
             // TODO: consider fixed-column specializations with stack-allocated state
@@ -357,6 +390,26 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
             Index start_slot = start_bucket * BandingStorage::kBucketSize;
             /* NOTE: For the last thread, end_bucket * kBucketSize may actually be less than num_slots */
             Index end_slot = end_bucket >= num_buckets ? num_slots : end_bucket * BandingStorage::kBucketSize;
+
+            /* if this isn't the last thread, check if the necessary amount
+               of empty rows is present for parallel processing to work
+               (if the back substitution is called with the same amount of
+               threads as the insertion, this should always be the case) */
+            /* FIXME: don't process these rows twice (although I guess that
+               would be a bit of a micro-optimization) */
+            if (end_bucket < num_buckets) {
+                for (Index i = end_slot; i > end_slot - kCoeffBits;) {
+                    --i;
+                    CoeffRow cr = bs.GetCoeffs(i);
+                    if (cr != 0) {
+                        std::scoped_lock lk(output_mutex);
+                        std::cerr << "ERROR: Thread " << ti << " found non-zero " <<
+                                     "coefficient row in back substitution!\n";
+                        /* FIXME: better error handling? */
+                        abort();
+                    }
+                }
+            }
 
             /* There are at least kCoeffBits rows of zero due to the bumping of a
                bucket between two threads, so we just round down here */

@@ -358,6 +358,9 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     using Hash = typename Hasher::Hash;
     constexpr bool kFCA1 = Hasher::kFirstCoeffAlwaysOne;
     constexpr bool oneBitThresh = Hasher::kThreshMode == ThreshMode::onebit;
+    constexpr Index kMinBucketsPerThread = BandingStorage::kMinBucketsPerThread;
+    /* less than 2 wouldn't make sense since one bucket is bumped per thread */
+    static_assert(kMinBucketsPerThread >= 2);
 
     constexpr bool debug = false;
     constexpr bool log = Hasher::log;
@@ -372,9 +375,20 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     const Index num_starts = bs->GetNumStarts();
     const Index num_buckets = bs->GetNumBuckets();
 
-    std::size_t buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
-    if (buckets_per_thread < 2)
-        return BandingAddRange(bs, hasher, begin, end, bump_vec);
+    std::size_t orig_num_threads = num_threads;
+    /* NOTE: Here, we round down in order to make sure that all threads
+       get at least kMinBucketsPerThread buckets. Below, we round up
+       for the actual distribution. */
+    /* FIXME: should num_threads be a power of 2? */
+    std::size_t buckets_per_thread = num_buckets / num_threads;
+    if (buckets_per_thread < kMinBucketsPerThread) {
+        num_threads = num_buckets / kMinBucketsPerThread;
+        assert(num_threads < orig_num_threads);
+        LOGC(log) << "reducing to " << num_threads << " threads.\n";
+        if (num_threads <= 1)
+            return BandingAddRange(bs, hasher, begin, end, bump_vec);
+    }
+    buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
 
     sLOG << "Constructing ribbon with" << num_buckets
          << "buckets,  num_starts = " << num_starts;
@@ -394,8 +408,8 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
 
         std::size_t items_per_thread = (num_items + num_threads - 1) / num_threads;
         std::vector<std::thread> threads;
-        threads.reserve(num_threads);
-        for (std::size_t ti = 0; ti < num_threads; ++ti) {
+        threads.reserve(orig_num_threads);
+        for (std::size_t ti = 0; ti < orig_num_threads; ++ti) {
             threads.emplace_back([&, ti]() {
                 Index start_idx = static_cast<Index>(ti * items_per_thread);
                 Index end_idx = static_cast<Index>(std::min((ti + 1) * items_per_thread, static_cast<std::size_t>(num_items)));

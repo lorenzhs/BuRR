@@ -78,6 +78,8 @@ constexpr unsigned thresh_meta_bits =
     [[maybe_unused]] static constexpr auto kResultBits = Config::kResultBits;   \
     [[maybe_unused]] static constexpr Index kBucketSize =                       \
         RibbonConfig::kBucketSize;                                              \
+    [[maybe_unused]] static constexpr Index kMinBucketsPerThread =              \
+        RibbonConfig::kMinBucketsPerThread;                                     \
                                                                                 \
     /* Export to algorithm */                                                   \
     [[maybe_unused]] static constexpr bool kIsFilter = RibbonConfig::kIsFilter; \
@@ -118,7 +120,8 @@ std::string dump_config() {
       << " mode=" << (int)kThreshMode << " sparse=" << kSparseCoeffs << " sol="
       << (kUseInterleavedSol ? "int" : (kUseCacheLineStorage ? "cls" : "basic"))
       << " fcao=" << kFirstCoeffAlwaysOne << " idxbits=" << 8u * sizeof(Index)
-      << " keybits=" << 8u * sizeof(Key) << " filter=" << kIsFilter;
+      << " keybits=" << 8u * sizeof(Key) << " filter=" << kIsFilter
+      << " minbpt=" << kMinBucketsPerThread;
     return s.str();
 }
 
@@ -153,6 +156,11 @@ public:
     // How many items form a bucket.  This should be O(L^2/log(L)) - see
     // recommended_bucket_size below, don't use this value
     static constexpr Index kBucketSize = 16u * sizeof(CoeffRow);
+
+    // The minimum number of buckets that should be processed per thread when
+    // inserting elements in parallel. If there are too few buckets, the number
+    // of threads is reduced.
+    static constexpr Index kMinBucketsPerThread = 200000 / kBucketSize;
 
     // How many bits the retrieval data structure should store per key / how
     // many fingerprint bits to use in a filter.  When using interleaved
@@ -237,7 +245,7 @@ constexpr size_t recommended_bucket_size =
 // think about, see below for some reasonable presets.
 template <size_t coeff_bits, size_t result_bits, ThreshMode mode = ThreshMode::twobit,
           bool sparse = false, bool interleaved = false, bool cls = false,
-          int bucket_sh = 0, typename Key = int>
+          int bucket_sh = 0, typename Key = int, int min_buckets_per_thread = -1>
 struct RConfig
     : public DefaultConfig<at_least_t<coeff_bits>, at_least_t<result_bits>, Key> {
     using Super =
@@ -257,6 +265,8 @@ struct RConfig
     static constexpr Index kBucketSize =
         bucket_sh < 0 ? (recommended_bucket_size<coeff_bits, mode> >> -bucket_sh)
                       : (recommended_bucket_size<coeff_bits, mode> << bucket_sh);
+    static constexpr Index kMinBucketsPerThread =
+        min_buckets_per_thread < 0 ? 200000 / kBucketSize : min_buckets_per_thread;
     /* FIXME: change kUseMHC to true again after the parallel version of that is implemented */
     static constexpr bool kSparseCoeffs = sparse,
                           kUseInterleavedSol = interleaved,
