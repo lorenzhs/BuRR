@@ -92,14 +92,14 @@ __attribute__((noinline)) void my_sort(Iterator begin, Iterator end) {
 }
 
 template <typename Iterator>
-__attribute__((noinline)) void my_sort_parallel(Iterator begin, Iterator end) {
+__attribute__((noinline)) void my_sort_parallel(Iterator begin, Iterator end, std::size_t num_threads) {
 #ifdef RIBBON_USE_STD_SORT
     // Use std::sort as a slow fallback
     std::sort(std::execution::par_unseq, begin, end, [](const auto &a, const auto &b) {
         return std::get<0>(a) < std::get<0>(b);
     });
 #else
-    ips2ra::parallel::sort(begin, end, [](const auto &x) { return std::get<0>(x); });
+    ips2ra::parallel::sort(begin, end, [](const auto &x) { return std::get<0>(x); }, num_threads);
 #endif
 }
 
@@ -436,8 +436,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     }
     LOGC(log) << "\tInput transformation took "
               << timer.ElapsedNanos(true) / 1e6 << "ms";
-    /* FIXME: this doesn't take num_threads into account */
-    my_sort_parallel(input.get(), input.get() + num_items);
+    my_sort_parallel(input.get(), input.get() + num_items, num_threads);
     LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
 
     const auto do_bump = [&](auto &thread_bump_vec, auto &vec) {
