@@ -96,6 +96,8 @@ constexpr unsigned thresh_meta_bits =
     [[maybe_unused]] static constexpr bool kUseMHC = RibbonConfig::kUseMHC;     \
     [[maybe_unused]] static constexpr bool kUseMultiplyShiftHash =              \
         RibbonConfig::kUseMultiplyShiftHash;                                    \
+    [[maybe_unused]] static constexpr bool kBumpWholeBucket =                   \
+        RibbonConfig::kBumpWholeBucket;                                         \
                                                                                 \
     static_assert(!kUseInterleavedSol || !kUseCacheLineStorage,                 \
                   "can't have both");                                           \
@@ -121,7 +123,7 @@ std::string dump_config() {
       << (kUseInterleavedSol ? "int" : (kUseCacheLineStorage ? "cls" : "basic"))
       << " fcao=" << kFirstCoeffAlwaysOne << " idxbits=" << 8u * sizeof(Index)
       << " keybits=" << 8u * sizeof(Key) << " filter=" << kIsFilter
-      << " minbpt=" << kMinBucketsPerThread;
+      << " minbpt=" << kMinBucketsPerThread << " bumpwhole=" << kBumpWholeBucket;
     return s.str();
 }
 
@@ -211,6 +213,9 @@ public:
     static constexpr bool kUseMHC = false;
     // Whether to print timings and other information about the construction.
     static constexpr bool log = true;
+    // Whether parallel insertion should bump a whole bucket between threads
+    // or just the minimum amount of items needed.
+    static constexpr bool kBumpWholeBucket = true;
 };
 
 namespace {

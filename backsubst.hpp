@@ -96,6 +96,7 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
     constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U);
     constexpr auto kResultBits = static_cast<Index>(sizeof(ResultRow) * 8U);
     constexpr Index kMinBucketsPerThread = BandingStorage::kMinBucketsPerThread;
+    constexpr bool kBumpWholeBucket = BandingStorage::kBumpWholeBucket;
 
     const Index num_starts = bs.GetNumStarts();
     const Index num_buckets = bs.GetNumBuckets();
@@ -134,9 +135,19 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
             if (start_bucket >= num_buckets)
                 return;
             Index end_bucket = start_bucket + buckets_per_thread;
-            Index start_slot = start_bucket * BandingStorage::kBucketSize;
-            /* NOTE: For the last thread, end_bucket * kBucketSize may actually be less than num_slots */
-            Index end_slot = end_bucket >= num_buckets ? num_slots : end_bucket * BandingStorage::kBucketSize;
+            Index start_slot, end_slot;
+            if constexpr (kBumpWholeBucket) {
+                start_slot = start_bucket * BandingStorage::kBucketSize;
+                /* NOTE: For the last thread, end_bucket * kBucketSize may actually be less than num_slots */
+                end_slot = end_bucket >= num_buckets ? num_slots : end_bucket * BandingStorage::kBucketSize;
+            } else {
+                start_slot = ti == 0
+                                       ? start_bucket * BandingStorage::kBucketSize
+                                       : start_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
+                end_slot = end_bucket >= num_buckets
+                                     ? num_slots
+                                     : end_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
+            }
             [[maybe_unused]] Index safe_end = 0;
             [[maybe_unused]] Index safe_start = 0;
             if constexpr (BandingStorage::kUseCacheLineStorage) {
@@ -156,10 +167,9 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
                (if the back substitution is called with the same amount of
                threads as the insertion, this should always be the case) */
             if (end_bucket < num_buckets) {
-                for (Index i = end_slot; i > end_slot - kCoeffBits;) {
-                    --i;
-                    CoeffRow cr = bs.GetCoeffs(i);
-                    if (cr != 0) {
+                for (Index i = 1; i < kCoeffBits; ++i) {
+                    CoeffRow cr = bs.GetCoeffs(end_slot - i);
+                    if ((cr >> i) != 0) {
                         std::scoped_lock lk(output_mutex);
                         std::cerr << "ERROR: Thread " << ti << " found non-zero " <<
                                      "coefficient row in back substitution!\n";
@@ -167,7 +177,6 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
                         abort();
                     }
                 }
-                end_slot -= kCoeffBits;
             }
             for (Index i = end_slot; i > start_slot;) {
                 --i;
@@ -329,6 +338,7 @@ void InterleavedBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
 template <typename BandingStorage, typename SolutionStorage>
 void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std::size_t num_threads) {
     using CoeffRow = typename BandingStorage::CoeffRow;
+    using ResultRow = typename BandingStorage::ResultRow;
     using Index = typename BandingStorage::Index;
 
     static_assert(sizeof(Index) == sizeof(typename SolutionStorage::Index),
@@ -339,6 +349,7 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
     constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U),
                    kResultBits = SolutionStorage::kResultBits;
     constexpr Index kMinBucketsPerThread = BandingStorage::kMinBucketsPerThread;
+    constexpr bool kBumpWholeBucket = BandingStorage::kBumpWholeBucket;
 
     constexpr bool debug = false;
     const Index num_slots = bs.GetNumSlots();
@@ -387,35 +398,56 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
             if (start_bucket >= num_buckets)
                 return;
             Index end_bucket = start_bucket + buckets_per_thread;
-            Index start_slot = start_bucket * BandingStorage::kBucketSize;
-            /* NOTE: For the last thread, end_bucket * kBucketSize may actually be less than num_slots */
-            Index end_slot = end_bucket >= num_buckets ? num_slots : end_bucket * BandingStorage::kBucketSize;
 
+            Index start_slot, end_slot;
+            if constexpr (kBumpWholeBucket) {
+                start_slot = start_bucket * BandingStorage::kBucketSize;
+                /* NOTE: For the last thread, end_bucket * kBucketSize may actually be less than num_slots */
+                end_slot = end_bucket >= num_buckets ? num_slots : end_bucket * BandingStorage::kBucketSize;
+            } else {
+                start_slot = ti == 0
+                                       ? start_bucket * BandingStorage::kBucketSize
+                                       : start_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
+                end_slot = end_bucket >= num_buckets
+                                     ? num_slots
+                                     : end_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
+            }
+
+            Index start_block = start_slot / kCoeffBits;
+            Index block = end_slot / kCoeffBits;
+            Index segment = block * kResultBits;
+            Index real_end_pos = block * kCoeffBits;
             /* if this isn't the last thread, check if the necessary amount
                of empty rows is present for parallel processing to work
                (if the back substitution is called with the same amount of
                threads as the insertion, this should always be the case) */
-            /* FIXME: don't process these rows twice (although I guess that
-               would be a bit of a micro-optimization) */
             if (end_bucket < num_buckets) {
-                for (Index i = end_slot; i > end_slot - kCoeffBits;) {
-                    --i;
-                    CoeffRow cr = bs.GetCoeffs(i);
-                    if (cr != 0) {
+                for (Index i = 1; i < kCoeffBits; ++i) {
+                    CoeffRow cr = bs.GetCoeffs(end_slot - i);
+                    if ((cr >> i) != 0) {
                         std::scoped_lock lk(output_mutex);
                         std::cerr << "ERROR: Thread " << ti << " found non-zero " <<
                                      "coefficient row in back substitution!\n";
                         /* FIXME: better error handling? */
                         abort();
                     }
+
+                    /* we need to initialize state with the rows that are in the
+                       bumped area but are processed by the next thread because
+                       only complete blocks are processed */
+                    if (end_slot - i >= real_end_pos) {
+                        ResultRow rr = bs.GetResult(end_slot - i);
+                        for (Index j = 0; j < kResultBits; ++j) {
+                            CoeffRow tmp = state[j] << 1;
+                            int bit = rocksdb::BitParity(tmp & cr) ^ ((rr >> j) & 1);
+                            tmp |= static_cast<CoeffRow>(bit);
+                            state[j] = tmp;
+                        }
+                    }
+
                 }
             }
 
-            /* There are at least kCoeffBits rows of zero due to the bumping of a
-               bucket between two threads, so we just round down here */
-            Index start_block = start_slot / kCoeffBits;
-            Index block = end_slot / kCoeffBits;
-            Index segment = block * kResultBits;
             while (block > start_block) {
                 --block;
                 /* FIXME: this debug statement won't work properly

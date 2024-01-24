@@ -359,8 +359,15 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     constexpr bool kFCA1 = Hasher::kFirstCoeffAlwaysOne;
     constexpr bool oneBitThresh = Hasher::kThreshMode == ThreshMode::onebit;
     constexpr Index kMinBucketsPerThread = BandingStorage::kMinBucketsPerThread;
+    constexpr bool kBumpWholeBucket = BandingStorage::kBumpWholeBucket;
+    constexpr Index kBucketSize = BandingStorage::kBucketSize;
+    constexpr Index kCoeffBits = BandingStorage::kCoeffBits;
     /* less than 2 wouldn't make sense since one bucket is bumped per thread */
     static_assert(kMinBucketsPerThread >= 2);
+    /* We need to bump at least kCoeffBits - 1 columns between threads, so if
+       kBumpWholeBucket is set, we need to know how many buckets to bump */
+    [[maybe_unused]] constexpr Index bump_buckets =
+        kCoeffBits <= 1 ? 1 : (kCoeffBits - 1 + kBucketSize - 1) / kBucketSize;
 
     constexpr bool debug = false;
     constexpr bool log = Hasher::log;
@@ -466,12 +473,18 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
             Index start_bucket = ti * buckets_per_thread;
             if (start_bucket >= num_buckets)
                 return;
-            /* last bucket is bumped (except for last thread) */
-            Index end_bucket = start_bucket + buckets_per_thread;
-            if (end_bucket >= num_buckets)
-                end_bucket = num_buckets - 1;
-            else
-                end_bucket -= 2;
+            Index end_bucket;
+            if constexpr (kBumpWholeBucket) {
+                end_bucket = start_bucket + buckets_per_thread;
+                if (end_bucket >= num_buckets)
+                    end_bucket = num_buckets - 1;
+                else
+                    end_bucket -= 1 + bump_buckets;
+            } else {
+                end_bucket = start_bucket + buckets_per_thread - 1;
+                if (end_bucket >= num_buckets)
+                    end_bucket = num_buckets - 1;
+            }
             auto start_it = std::lower_bound(
                 input.get(), input.get() + num_items, start_bucket, [](const auto& e, auto v) {
                 return Hasher::GetBucket(std::get<0>(e)) < v;
@@ -508,6 +521,9 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                 border_mutexes[ti - 1].lock();
                 start_locked = true;
             }
+            [[maybe_unused]] Index bump_start = ti == 0
+                                   ? start_bucket * BandingStorage::kBucketSize
+                                   : start_bucket * BandingStorage::kBucketSize + BandingStorage::kCoeffBits - 1;
 
 #ifndef RIBBON_PASS_HASH
             auto next = *(begin + input[start_index].second);
@@ -594,7 +610,17 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                                          ? hasher.GetResultRowFromHash(hash)
                                          : hasher.GetResultRowFromInput(*(begin + idx));
 
-                auto [success, row] = BandingAdd<kFCA1>(bs, start, cr, rr);
+                bool success;
+                Index row;
+                if constexpr (kBumpWholeBucket) {
+                    std::tie(success, row) = BandingAdd<kFCA1>(bs, start, cr, rr);
+                } else {
+                    /* The first kCoeffBits rows of the first bucket are bumped */
+                    std::tie(success, row) = start < bump_start
+                                              ? std::make_pair(false, start)
+                                              : BandingAdd<kFCA1>(bs, start, cr, rr);
+                }
+
                 if (!success) {
                     assert(all_good);
                     // if we got this far, this is the first failure in this bucket,
@@ -653,36 +679,39 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                 bs->SetMeta(last_bucket, thresh);
             }
 
-            /* bump all items in last bucket of range */
-            if (ti != num_threads - 1) {
-                if (!end_locked) {
-                    border_mutexes[ti].lock();
-                    end_locked = true;
-                }
-                Index bucket = end_bucket + 1;
-                /* FIXME: it might be better to just have a function AllBumpThresh()
-                   (like NoBumpThresh()) to get the proper threshold */
-                if (end_index < num_items) {
-                    Index val = Hasher::GetIntraBucket(std::get<0>(input[end_index]));
-                    Index cval = hasher.Compress(val);
-                    if constexpr (oneBitThresh) {
-                        if (cval == 2) {
-                            {
-                                std::scoped_lock lock(hash_mtx);
-                                hasher.Set(bucket, val);
+            if constexpr (kBumpWholeBucket) {
+                /* bump all items in last bucket of range */
+                if (end_bucket < num_buckets - 1) {
+                    assert(ti < num_threads - 1);
+                    if (!end_locked) {
+                        border_mutexes[ti].lock();
+                        end_locked = true;
+                    }
+                    Index bucket = end_bucket + 1;
+                    /* FIXME: it might be better to just have a function AllBumpThresh()
+                       (like NoBumpThresh()) to get the proper threshold */
+                    if (end_index < num_items) {
+                        Index val = Hasher::GetIntraBucket(std::get<0>(input[end_index]));
+                        Index cval = hasher.Compress(val);
+                        if constexpr (oneBitThresh) {
+                            if (cval == 2) {
+                                {
+                                    std::scoped_lock lock(hash_mtx);
+                                    hasher.Set(bucket, val);
+                                }
+                                bs->SetMeta(bucket, 0);
+                            } else {
+                                bs->SetMeta(bucket, cval);
                             }
-                            bs->SetMeta(bucket, 0);
                         } else {
                             bs->SetMeta(bucket, cval);
                         }
-                    } else {
-                        bs->SetMeta(bucket, cval);
                     }
-                }
-                for (Index i = end_index; i < static_cast<Index>(num_items); ++i) {
-                    if (bucket != Hasher::GetBucket(std::get<0>(input[i])))
-                        break;
-                    thread_bump_vecs[ti].push_back(*(begin + std::get<1>(input[i])));
+                    for (Index i = end_index; i < static_cast<Index>(num_items); ++i) {
+                        if (bucket != Hasher::GetBucket(std::get<0>(input[i])))
+                            break;
+                        thread_bump_vecs[ti].push_back(*(begin + std::get<1>(input[i])));
+                    }
                 }
             }
             if (end_locked) {
