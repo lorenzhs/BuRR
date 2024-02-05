@@ -362,12 +362,15 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     constexpr bool kBumpWholeBucket = BandingStorage::kBumpWholeBucket;
     constexpr Index kBucketSize = BandingStorage::kBucketSize;
     constexpr Index kCoeffBits = BandingStorage::kCoeffBits;
-    /* less than 2 wouldn't make sense since one bucket is bumped per thread */
-    static_assert(kMinBucketsPerThread >= 2);
+    constexpr Index kBucketSearchRange = BandingStorage::kBucketSearchRange;
     /* We need to bump at least kCoeffBits - 1 columns between threads, so if
        kBumpWholeBucket is set, we need to know how many buckets to bump */
     [[maybe_unused]] constexpr Index bump_buckets =
         kCoeffBits <= 1 ? 1 : (kCoeffBits - 1 + kBucketSize - 1) / kBucketSize;
+    /* less than this wouldn't make sense since bump_buckets buckets are bumped
+       per thread (that is technically not true for kBumpWholeBucket=false, but
+       it would still be absurd to have fewer buckets than this) */
+    static_assert(kMinBucketsPerThread >= 1 + bump_buckets);
 
     constexpr bool debug = false;
     constexpr bool log = Hasher::log;
@@ -468,13 +471,21 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     /* FIXME: make hasher.Set concurrent to remove this mutex */
     [[maybe_unused]] std::conditional_t<oneBitThresh, std::mutex, int> hash_mtx;
     std::vector<std::mutex> border_mutexes(num_threads - 1);
+    [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::vector<Index>> thread_ends(num_threads - 1);
+    [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::vector<Index>> thread_starts(num_threads - 1);
+    if constexpr (kBucketSearchRange > 0) {
+        bs->SetNumThreads(num_threads);
+    }
+    [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::mutex> search_mtx;
+    [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::condition_variable> search_cv;
+    [[maybe_unused]] std::size_t search_rem = num_threads;
     for (std::size_t ti = 0; ti < num_threads; ++ti) {
         threads.emplace_back([&, ti]() {
             Index start_bucket = ti * buckets_per_thread;
             if (start_bucket >= num_buckets)
                 return;
             Index end_bucket;
-            if constexpr (kBumpWholeBucket) {
+            if constexpr (kBumpWholeBucket && kBucketSearchRange <= 0) {
                 end_bucket = start_bucket + buckets_per_thread;
                 if (end_bucket >= num_buckets)
                     end_bucket = num_buckets - 1;
@@ -498,11 +509,147 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
             }
             Index start_index = start_it - input.get();
             Index end_index = end_it - input.get();
+
+            /* FIXME: deal with empty buckets */
+            if constexpr (kBucketSearchRange > 0) {
+                if constexpr (bump_buckets == 1) {
+                    if constexpr (kBumpWholeBucket) {
+                        if (ti < num_threads) {
+                            Index cur_bucket = end_bucket;
+                            Index min_bucket = end_bucket;
+                            Index min_elems = std::numeric_limits<Index>::max();
+                            Index min_bucket_start = end_index;
+                            Index min_bucket_end = end_index;
+                            Index cur_bucket_end = end_index;
+                            Index cur_elems = 0;
+                            for (Index i = end_index; i-- > start_index;) {
+                                Index bucket = Hasher::GetBucket(std::get<0>(input[i]));
+                                if (bucket != cur_bucket) {
+                                    if (cur_elems < min_elems) {
+                                        min_elems = cur_elems;
+                                        min_bucket = cur_bucket;
+                                        min_bucket_start = i + 1;
+                                        min_bucket_end = cur_bucket_end;
+                                    }
+                                    if (bucket + kBucketSearchRange <= end_bucket)
+                                        break;
+                                    cur_elems = 0;
+                                    cur_bucket = bucket;
+                                    cur_bucket_end = i + 1;
+                                }
+                                ++cur_elems;
+                            }
+                            /* this should only happen if end_index == start_index or
+                               the loop ran down all the way to start_index, both of
+                               which are edge cases that should never happen when the
+                               parameters are chosen properly */
+                            if (cur_elems < min_elems) {
+                                min_bucket = cur_bucket;
+                                min_bucket_start = start_index;
+                                min_bucket_end = cur_bucket_end;
+                            }
+                            bs->SetThreadBorderBucket(ti, min_bucket);
+                            /* no, these are not accidentally swapped */
+                            thread_starts[ti] = min_bucket_end;
+                            thread_ends[ti] = min_bucket_start;
+                        }
+                    } else {
+                        if (ti > 0) {
+                            Index cur_bucket = start_bucket;
+                            Index min_bucket = start_bucket;
+                            Index min_elems = std::numeric_limits<Index>::max();
+                            Index min_bucket_start = start_index;
+                            Index cur_elems = 0;
+                            Index cur_bucket_start = start_index;
+                            Index cur_bump_start = start_bucket * kBucketSize + BandingStorage::kCoeffBits - 1;
+                            bool bumped = false;
+                            for (Index i = start_index; i < end_index; ++i) {
+                                Index sortpos = std::get<0>(input[i]);
+                                Index bucket = Hasher::GetBucket(sortpos);
+                                Index start = Hasher::SortToStart(sortpos);
+                                if (bucket != cur_bucket) {
+                                    if (cur_elems < min_elems) {
+                                        min_elems = cur_elems;
+                                        min_bucket = cur_bucket;
+                                        min_bucket_start = cur_bucket_start;
+                                    }
+                                    if (bucket >= start_bucket + kBucketSearchRange)
+                                        break;
+                                    cur_elems = 0;
+                                    cur_bucket_start = i;
+                                    cur_bucket = bucket;
+                                    cur_bump_start = cur_bucket * kBucketSize + BandingStorage::kCoeffBits - 1;
+                                    bumped = false;
+                                }
+                                if (start < cur_bump_start) {
+                                    /* we need to backtrack to really find out how many
+                                       items would be bumped in the insertion algorithm */
+                                    if (!bumped) {
+                                        /* FIXME: handle 1+ case */
+                                        bumped = true;
+                                        Index cval = hasher.Compress(Hasher::GetIntraBucket(sortpos));
+                                        for (Index j = i; j-- > cur_bucket_start;) {
+                                            if (hasher.Compress(Hasher::GetIntraBucket(std::get<0>(input[j]))) != cval)
+                                                break;
+                                            ++cur_elems;
+                                        }
+                                    }
+                                    ++cur_elems;
+                                }
+                            }
+                            /* this should only happen if end_index == start_index or
+                               the loop ran all the way to end_index - 1, both of
+                               which are edge cases that should never happen when the
+                               parameters are chosen properly */
+                            if (cur_elems < min_elems) {
+                                min_bucket = cur_bucket;
+                                min_bucket_start = cur_bucket_start;
+                            }
+                            bs->SetThreadBorderBucket(ti - 1, min_bucket);
+                            thread_starts[ti - 1] = min_bucket_start;
+                            thread_ends[ti - 1] = min_bucket_start;
+                        }
+                    }
+                } else {
+                    std::cerr << "kBucketSize < kCoeffBits - 1 is currently not supported with search range!\n";
+                    abort();
+                }
+                {
+                    std::unique_lock l(search_mtx);
+                    --search_rem;
+                    if (search_rem > 0)
+                        search_cv.wait(l);
+                    else {
+                        search_cv.notify_all();
+                    }
+                }
+                if (ti < num_threads - 1) {
+                    end_bucket = bs->GetThreadBorderBucket(ti);
+                    /* FIXME: end_bucket == 0 would cause problems,
+                       but that would be really weird anyways */
+                    if (end_bucket > 0)
+                        --end_bucket;
+                    end_index = thread_ends[ti];
+                }
+                if (ti > 0) {
+                    start_bucket = bs->GetThreadBorderBucket(ti - 1);
+                    if constexpr (kBumpWholeBucket) {
+                        start_bucket += bump_buckets;
+                    }
+                    start_index = thread_starts[ti - 1];
+                }
+            }
+
             Index safe_start_bucket = bs->GetNextSafeStart(start_bucket);
             /* safe_end_bucket should be calculated with actual end bucket,
                including the bumped bucket
                GetPrevSafeEnd just returns num_buckets - 1 if the input is >= that */
-            Index safe_end_bucket = bs->GetPrevSafeEnd(start_bucket + buckets_per_thread - 1);
+            Index safe_end_bucket;
+            if constexpr (kBumpWholeBucket) {
+                safe_end_bucket = bs->GetPrevSafeEnd(end_bucket + bump_buckets);
+            } else {
+                safe_end_bucket = bs->GetPrevSafeEnd(end_bucket);
+            }
 
             Index last_bucket = start_bucket;
             bool all_good = true;
@@ -687,12 +834,11 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                         border_mutexes[ti].lock();
                         end_locked = true;
                     }
-                    Index bucket = end_bucket + 1;
-                    /* FIXME: it might be better to just have a function AllBumpThresh()
-                       (like NoBumpThresh()) to get the proper threshold */
-                    if (end_index < num_items) {
-                        Index val = Hasher::GetIntraBucket(std::get<0>(input[end_index]));
-                        Index cval = hasher.Compress(val);
+                    Index val = 0;
+                    Index cval = hasher.Compress(val);
+                    for (Index bucket = end_bucket + 1; bucket <= end_bucket + bump_buckets; ++bucket) {
+                        /* FIXME: it might be better to just have a function AllBumpThresh()
+                           (like NoBumpThresh()) to get the proper threshold */
                         if constexpr (oneBitThresh) {
                             if (cval == 2) {
                                 {
@@ -708,7 +854,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                         }
                     }
                     for (Index i = end_index; i < static_cast<Index>(num_items); ++i) {
-                        if (bucket != Hasher::GetBucket(std::get<0>(input[i])))
+                        if (end_bucket + bump_buckets < Hasher::GetBucket(std::get<0>(input[i])))
                             break;
                         thread_bump_vecs[ti].push_back(*(begin + std::get<1>(input[i])));
                     }

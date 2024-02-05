@@ -176,6 +176,20 @@ public:
     inline Index GetNumBuckets() const { return num_buckets_; }
     // clang-format on
 
+    inline void SetNumThreads(std::size_t num_threads) {
+        thread_bucket_borders.resize(num_threads - 1);
+    }
+
+    inline Index GetThreadBorderBucket(std::size_t t) const {
+        /* this uses .at so a wrong thread number given to
+           the back substitution is caught immediately */
+        return thread_bucket_borders.at(t);
+    }
+
+    inline void SetThreadBorderBucket(std::size_t t, Index bucket) {
+        thread_bucket_borders[t] = bucket;
+    }
+
     size_t Size() const {
         const size_t meta_bytes = GetMetaSize() * sizeof(meta_t);
         sLOGC(Config::log) << "\tmeta size: " << num_buckets_ << "*"
@@ -190,6 +204,8 @@ protected:
     // num_buckets_ is for debugging only & can be recomputed easily
     Index num_slots_ = 0, num_buckets_ = 0;
     std::unique_ptr<meta_t[]> meta_;
+    /* NOTE: This is only here temporarily while testing kBucketSearchRange */
+    std::vector<Index> thread_bucket_borders;
 };
 } // namespace
 

@@ -98,6 +98,8 @@ constexpr unsigned thresh_meta_bits =
         RibbonConfig::kUseMultiplyShiftHash;                                    \
     [[maybe_unused]] static constexpr bool kBumpWholeBucket =                   \
         RibbonConfig::kBumpWholeBucket;                                         \
+    [[maybe_unused]] static constexpr Index kBucketSearchRange =                \
+        RibbonConfig::kBucketSearchRange;                                       \
                                                                                 \
     static_assert(!kUseInterleavedSol || !kUseCacheLineStorage,                 \
                   "can't have both");                                           \
@@ -215,7 +217,12 @@ public:
     static constexpr bool log = true;
     // Whether parallel insertion should bump a whole bucket between threads
     // or just the minimum amount of items needed.
-    static constexpr bool kBumpWholeBucket = true;
+    static constexpr bool kBumpWholeBucket = false;
+    // Number of buckets to search to find the bucket in which the
+    // minimum number of elements needs to be bumped
+    // (when using the parallel version)
+    // Set to 0 disable.
+    static constexpr Index kBucketSearchRange = 20;
 };
 
 namespace {
