@@ -50,6 +50,10 @@ using make_fast_t = at_least_fast_t<8u * sizeof(uint_type)>;
 // threshold compression modes
 enum class ThreshMode : int { normal = 0, onebit = 1, twobit = 2 };
 
+// mode for searching for the bucket in which to bump elements between threads
+// (in the parallel version)
+enum class BucketSearchMode : int { minbump = 0, maxprev = 1, diff = 2 };
+
 template <typename Config>
 constexpr unsigned thresh_meta_bits =
     Config::kThreshMode == ThreshMode::normal
@@ -100,6 +104,8 @@ constexpr unsigned thresh_meta_bits =
         RibbonConfig::kBumpWholeBucket;                                         \
     [[maybe_unused]] static constexpr Index kBucketSearchRange =                \
         RibbonConfig::kBucketSearchRange;                                       \
+    [[maybe_unused]] static constexpr BucketSearchMode kBucketSearchMode =      \
+        RibbonConfig::kBucketSearchMode;                                        \
                                                                                 \
     static_assert(!kUseInterleavedSol || !kUseCacheLineStorage,                 \
                   "can't have both");                                           \
@@ -217,12 +223,23 @@ public:
     static constexpr bool log = true;
     // Whether parallel insertion should bump a whole bucket between threads
     // or just the minimum amount of items needed.
+    // Bumping the whole bucket is currently not supported when kBucketSearchRange > 0
     static constexpr bool kBumpWholeBucket = false;
     // Number of buckets to search to find the bucket in which the
     // minimum number of elements needs to be bumped
     // (when using the parallel version)
     // Set to 0 disable.
-    static constexpr Index kBucketSearchRange = 20;
+    static constexpr Index kBucketSearchRange = 50;
+    // Mode to use to search for the best bucket in which to bump elements
+    // between threads (in the parallel version).
+    // `minbump` takes the bucket in which the smallest number of elements needs to
+    // be bumped directly.
+    // `maxprev` takes the bucket with the most elements in the kCoeffBits-1 start
+    // positions before the start of the bucket.
+    // `diff` takes the bucket that minimizes the number of elements that need to
+    // be bumped directly minus the number of elements in the kCoeffBits-1 start
+    // positions before the start of the bucket.
+    static constexpr BucketSearchMode kBucketSearchMode = BucketSearchMode::diff;
 };
 
 namespace {

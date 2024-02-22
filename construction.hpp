@@ -363,6 +363,8 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     constexpr Index kBucketSize = BandingStorage::kBucketSize;
     constexpr Index kCoeffBits = BandingStorage::kCoeffBits;
     constexpr Index kBucketSearchRange = BandingStorage::kBucketSearchRange;
+    constexpr BucketSearchMode kBucketSearchMode = BandingStorage::kBucketSearchMode;
+
     /* We need to bump at least kCoeffBits - 1 columns between threads, so if
        kBumpWholeBucket is set, we need to know how many buckets to bump */
     [[maybe_unused]] constexpr Index bump_buckets =
@@ -510,105 +512,112 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
             Index start_index = start_it - input.get();
             Index end_index = end_it - input.get();
 
-            /* FIXME: deal with empty buckets */
+            /* kBumpWholeBucket is currently not supported when searching
+               for the best bucket */
+            /* kBucketSearchRange > 0 => !kBumpWholeBucket */
+            static_assert(kBucketSearchRange == 0 || !kBumpWholeBucket);
             if constexpr (kBucketSearchRange > 0) {
                 if constexpr (bump_buckets == 1) {
-                    if constexpr (kBumpWholeBucket) {
-                        if (ti < num_threads) {
-                            Index cur_bucket = end_bucket;
-                            Index min_bucket = end_bucket;
-                            Index min_elems = std::numeric_limits<Index>::max();
-                            Index min_bucket_start = end_index;
-                            Index min_bucket_end = end_index;
-                            Index cur_bucket_end = end_index;
-                            Index cur_elems = 0;
-                            for (Index i = end_index; i-- > start_index;) {
-                                Index bucket = Hasher::GetBucket(std::get<0>(input[i]));
-                                if (bucket != cur_bucket) {
-                                    if (cur_elems < min_elems) {
-                                        min_elems = cur_elems;
-                                        min_bucket = cur_bucket;
-                                        min_bucket_start = i + 1;
-                                        min_bucket_end = cur_bucket_end;
-                                    }
-                                    if (bucket + kBucketSearchRange <= end_bucket)
-                                        break;
-                                    cur_elems = 0;
-                                    cur_bucket = bucket;
-                                    cur_bucket_end = i + 1;
-                                }
-                                ++cur_elems;
-                            }
-                            /* this should only happen if end_index == start_index or
-                               the loop ran down all the way to start_index, both of
-                               which are edge cases that should never happen when the
-                               parameters are chosen properly */
-                            if (cur_elems < min_elems) {
-                                min_bucket = cur_bucket;
-                                min_bucket_start = start_index;
-                                min_bucket_end = cur_bucket_end;
-                            }
-                            bs->SetThreadBorderBucket(ti, min_bucket);
-                            /* no, these are not accidentally swapped */
-                            thread_starts[ti] = min_bucket_end;
-                            thread_ends[ti] = min_bucket_start;
-                        }
-                    } else {
-                        if (ti > 0) {
-                            Index cur_bucket = start_bucket;
-                            Index min_bucket = start_bucket;
-                            Index min_elems = std::numeric_limits<Index>::max();
-                            Index min_bucket_start = start_index;
-                            Index cur_elems = 0;
-                            Index cur_bucket_start = start_index;
-                            Index cur_bump_start = start_bucket * kBucketSize + BandingStorage::kCoeffBits - 1;
-                            bool bumped = false;
-                            for (Index i = start_index; i < end_index; ++i) {
+                    if (ti > 0) {
+                        Index cur_bucket = start_bucket;
+                        Index min_bucket = start_bucket;
+                        int min_elems = std::numeric_limits<int>::max();
+                        Index min_bucket_start = start_index;
+                        int cur_elems = 0;
+                        [[maybe_unused]] int old_next_elems = 0;
+                        [[maybe_unused]] int next_elems = 0;
+                        Index cur_bucket_start = start_index;
+                        [[maybe_unused]] Index next_count_start = start_bucket * kBucketSize - BandingStorage::kCoeffBits + 1;
+                        Index cur_bump_start = start_bucket * kBucketSize + BandingStorage::kCoeffBits - 1;
+                        bool bumped = false;
+                        if constexpr (kBucketSearchMode == BucketSearchMode::diff || kBucketSearchMode == BucketSearchMode::maxprev) {
+                            for (Index i = start_index; i-- > 0;) {
                                 Index sortpos = std::get<0>(input[i]);
                                 Index bucket = Hasher::GetBucket(sortpos);
                                 Index start = Hasher::SortToStart(sortpos);
-                                if (bucket != cur_bucket) {
-                                    if (cur_elems < min_elems) {
-                                        min_elems = cur_elems;
-                                        min_bucket = cur_bucket;
-                                        min_bucket_start = cur_bucket_start;
-                                    }
-                                    if (bucket >= start_bucket + kBucketSearchRange)
-                                        break;
-                                    cur_elems = 0;
-                                    cur_bucket_start = i;
-                                    cur_bucket = bucket;
-                                    cur_bump_start = cur_bucket * kBucketSize + BandingStorage::kCoeffBits - 1;
-                                    bumped = false;
-                                }
-                                if (start < cur_bump_start) {
-                                    /* we need to backtrack to really find out how many
-                                       items would be bumped in the insertion algorithm */
-                                    if (!bumped) {
-                                        /* FIXME: handle 1+ case */
-                                        bumped = true;
-                                        Index cval = hasher.Compress(Hasher::GetIntraBucket(sortpos));
-                                        for (Index j = i; j-- > cur_bucket_start;) {
-                                            if (hasher.Compress(Hasher::GetIntraBucket(std::get<0>(input[j]))) != cval)
-                                                break;
-                                            ++cur_elems;
-                                        }
-                                    }
-                                    ++cur_elems;
-                                }
+                                if (bucket < start_bucket - 1)
+                                    break;
+                                else if (start >= next_count_start)
+                                    ++old_next_elems;
                             }
-                            /* this should only happen if end_index == start_index or
-                               the loop ran all the way to end_index - 1, both of
-                               which are edge cases that should never happen when the
-                               parameters are chosen properly */
-                            if (cur_elems < min_elems) {
-                                min_bucket = cur_bucket;
-                                min_bucket_start = cur_bucket_start;
-                            }
-                            bs->SetThreadBorderBucket(ti - 1, min_bucket);
-                            thread_starts[ti - 1] = min_bucket_start;
-                            thread_ends[ti - 1] = min_bucket_start;
+                            next_count_start = (start_bucket + 1) * kBucketSize - BandingStorage::kCoeffBits + 1;
                         }
+                        for (Index i = start_index; i < end_index; ++i) {
+                            Index sortpos = std::get<0>(input[i]);
+                            Index bucket = Hasher::GetBucket(sortpos);
+                            Index start = Hasher::SortToStart(sortpos);
+                            if (bucket != cur_bucket) {
+                                int diff;
+                                if constexpr (kBucketSearchMode == BucketSearchMode::diff) {
+                                    diff = cur_elems - old_next_elems;
+                                } else if (kBucketSearchMode == BucketSearchMode::maxprev) {
+                                    diff = -old_next_elems;
+                                } else {
+                                    diff = cur_elems;
+                                }
+                                if (diff < min_elems) {
+                                    min_elems = diff;
+                                    min_bucket = cur_bucket;
+                                    min_bucket_start = cur_bucket_start;
+                                }
+                                if (bucket >= start_bucket + kBucketSearchRange)
+                                    break;
+                                cur_elems = 0;
+                                cur_bucket_start = i;
+                                cur_bucket = bucket;
+                                if constexpr (kBucketSearchMode == BucketSearchMode::diff || kBucketSearchMode == BucketSearchMode::maxprev) {
+                                    old_next_elems = next_elems;
+                                    next_elems = 0;
+                                    next_count_start = (cur_bucket + 1) * kBucketSize - BandingStorage::kCoeffBits + 1;
+                                }
+                                cur_bump_start = cur_bucket * kBucketSize + BandingStorage::kCoeffBits - 1;
+                                bumped = false;
+                            }
+                            if (start < cur_bump_start) {
+                                /* we need to backtrack to really find out how many
+                                   items would be bumped in the insertion algorithm */
+                                if (!bumped) {
+                                    bumped = true;
+                                    Index val = Hasher::GetIntraBucket(sortpos);
+                                    Index cval = hasher.Compress(val);
+                                    for (Index j = i; j-- > cur_bucket_start;) {
+                                        Index cur_val = Hasher::GetIntraBucket(std::get<0>(input[j]));
+                                        Index cur_cval = hasher.Compress(cur_val);
+                                        if constexpr (oneBitThresh) {
+                                            if (cval == 2 && cur_val != val)
+                                                break;
+                                        }
+                                        if (cur_cval != cval)
+                                            break;
+                                        ++cur_elems;
+                                    }
+                                }
+                                ++cur_elems;
+                            }
+                            if constexpr (kBucketSearchMode == BucketSearchMode::diff || kBucketSearchMode == BucketSearchMode::maxprev) {
+                                if (start >= next_count_start)
+                                    ++next_elems;
+                            }
+                        }
+                        int diff;
+                        if constexpr (kBucketSearchMode == BucketSearchMode::diff) {
+                            diff = cur_elems - old_next_elems;
+                        } else if (kBucketSearchMode == BucketSearchMode::maxprev) {
+                            diff = -old_next_elems;
+                        } else {
+                            diff = cur_elems;
+                        }
+                        /* this should only happen if end_index == start_index or
+                           the loop ran all the way to end_index - 1, both of
+                           which are edge cases that should never happen when the
+                           parameters are chosen properly */
+                        if (diff < min_elems) {
+                            min_bucket = cur_bucket;
+                            min_bucket_start = cur_bucket_start;
+                        }
+                        bs->SetThreadBorderBucket(ti - 1, min_bucket);
+                        thread_starts[ti - 1] = min_bucket_start;
+                        thread_ends[ti - 1] = min_bucket_start;
                     }
                 } else {
                     std::cerr << "kBucketSize < kCoeffBits - 1 is currently not supported with search range!\n";
@@ -619,9 +628,8 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                     --search_rem;
                     if (search_rem > 0)
                         search_cv.wait(l);
-                    else {
+                    else
                         search_cv.notify_all();
-                    }
                 }
                 if (ti < num_threads - 1) {
                     end_bucket = bs->GetThreadBorderBucket(ti);
@@ -632,6 +640,13 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                     end_index = thread_ends[ti];
                 }
                 if (ti > 0) {
+                    /* debug output */
+                    /*
+                    {
+                    std::unique_lock l(search_mtx);
+                    std::cerr << "START: " << ti << " " << start_bucket * kBucketSize << " " << bs->GetThreadBorderBucket(ti-1) * kBucketSize << "\n";
+                    }
+                    */
                     start_bucket = bs->GetThreadBorderBucket(ti - 1);
                     if constexpr (kBumpWholeBucket) {
                         start_bucket += bump_buckets;
@@ -901,6 +916,15 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     if constexpr (oneBitThresh) {
         hasher.Finalise(num_buckets);
     }
+
+    /* debug output */
+    /*
+    for (Index i = 0; i < bump_vec->size(); i++) {
+        const Hash h = hasher.GetHash((*bump_vec)[i]);
+        const Index start = hasher.GetStart(h, num_starts);
+        std::cerr << "BUMP: " << start << "\n";
+    }
+    */
 
     LOGC(log) << "\tActual insertion took " << timer.ElapsedNanos(true) / 1e6
               << "ms";
