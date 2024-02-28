@@ -593,7 +593,14 @@ public:
             return QueryFilterMHC(mhc);
         } else {
             auto [was_bumped, found] = Super::QueryFilter(key);
-            assert(!was_bumped);
+            // This assert can fail in certain circumstances with
+            // negative queries. There can be buckets that inserted
+            // item is mapped to, in which case the bucket is marked
+            // as "all bumped", meaning that any negative queries
+            // mapped to this bucket will return was_bumped.
+            // An alternative option would be to set the metadata for
+            // such a bucket to "nothing bumped".
+            //assert(!was_bumped);
             return found;
         }
     }

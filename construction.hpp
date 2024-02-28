@@ -922,7 +922,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     for (Index i = 0; i < bump_vec->size(); i++) {
         const Hash h = hasher.GetHash((*bump_vec)[i]);
         const Index start = hasher.GetStart(h, num_starts);
-        std::cerr << "BUMP: " << start << "\n";
+        std::cerr << "BUMP: " << start << " ; " << (*bump_vec)[i] << "\n";
     }
     */
 
