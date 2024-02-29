@@ -527,30 +527,30 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                         [[maybe_unused]] int old_next_elems = 0;
                         [[maybe_unused]] int next_elems = 0;
                         Index cur_bucket_start = start_index;
-                        [[maybe_unused]] Index next_count_start = start_bucket * kBucketSize - BandingStorage::kCoeffBits + 1;
-                        Index cur_bump_start = start_bucket * kBucketSize + BandingStorage::kCoeffBits - 1;
-                        bool bumped = false;
+                        [[maybe_unused]] const Index count_val = BandingStorage::kCoeffBits - 1;
+                        const Index bump_val = kBucketSize - BandingStorage::kCoeffBits + 1;
+                        const Index bump_cval = hasher.Compress(bump_val);
                         if constexpr (kBucketSearchMode == BucketSearchMode::diff || kBucketSearchMode == BucketSearchMode::maxprev) {
                             for (Index i = start_index; i-- > 0;) {
                                 Index sortpos = std::get<0>(input[i]);
                                 Index bucket = Hasher::GetBucket(sortpos);
-                                Index start = Hasher::SortToStart(sortpos);
+                                Index val = Hasher::GetIntraBucket(sortpos);
                                 if (bucket < start_bucket - 1)
                                     break;
-                                else if (start >= next_count_start)
+                                else if (val < count_val)
                                     ++old_next_elems;
                             }
-                            next_count_start = (start_bucket + 1) * kBucketSize - BandingStorage::kCoeffBits + 1;
                         }
                         for (Index i = start_index; i < end_index; ++i) {
                             Index sortpos = std::get<0>(input[i]);
                             Index bucket = Hasher::GetBucket(sortpos);
-                            Index start = Hasher::SortToStart(sortpos);
+                            Index val = Hasher::GetIntraBucket(sortpos);
+                            Index cval = hasher.Compress(val);
                             if (bucket != cur_bucket) {
                                 int diff;
                                 if constexpr (kBucketSearchMode == BucketSearchMode::diff) {
                                     diff = cur_elems - old_next_elems;
-                                } else if (kBucketSearchMode == BucketSearchMode::maxprev) {
+                                } else if constexpr (kBucketSearchMode == BucketSearchMode::maxprev) {
                                     diff = -old_next_elems;
                                 } else {
                                     diff = cur_elems;
@@ -568,34 +568,21 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                                 if constexpr (kBucketSearchMode == BucketSearchMode::diff || kBucketSearchMode == BucketSearchMode::maxprev) {
                                     old_next_elems = next_elems;
                                     next_elems = 0;
-                                    next_count_start = (cur_bucket + 1) * kBucketSize - BandingStorage::kCoeffBits + 1;
                                 }
-                                cur_bump_start = cur_bucket * kBucketSize + BandingStorage::kCoeffBits - 1;
-                                bumped = false;
                             }
-                            if (start < cur_bump_start) {
-                                /* we need to backtrack to really find out how many
-                                   items would be bumped in the insertion algorithm */
-                                if (!bumped) {
-                                    bumped = true;
-                                    Index val = Hasher::GetIntraBucket(sortpos);
-                                    Index cval = hasher.Compress(val);
-                                    for (Index j = i; j-- > cur_bucket_start;) {
-                                        Index cur_val = Hasher::GetIntraBucket(std::get<0>(input[j]));
-                                        Index cur_cval = hasher.Compress(cur_val);
-                                        if constexpr (oneBitThresh) {
-                                            if (cval == 2 && cur_val != val)
-                                                break;
-                                        }
-                                        if (cur_cval != cval)
-                                            break;
+                            if constexpr (oneBitThresh) {
+                                if (bump_cval == 2) {
+                                    if (val >= bump_val)
                                         ++cur_elems;
-                                    }
+                                } else if (cval >= bump_cval) {
+                                    ++cur_elems;
                                 }
-                                ++cur_elems;
+                            } else {
+                                if (cval >= bump_cval)
+                                    ++cur_elems;
                             }
                             if constexpr (kBucketSearchMode == BucketSearchMode::diff || kBucketSearchMode == BucketSearchMode::maxprev) {
-                                if (start >= next_count_start)
+                                if (val < count_val)
                                     ++next_elems;
                             }
                         }
