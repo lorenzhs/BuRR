@@ -463,13 +463,15 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
         vec.clear();
     };
 
-    /* FIXME: use sensible reserve() for bump_vec since more items
-       are being bumped now */
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
-    /* FIXME: sensible reserve() for these */
+    /* FIXME: decide if there's a better reserve size here */
     /* FIXME: avoid false cache sharing through push_back on these vectors */
     std::vector<BumpStorage> thread_bump_vecs(num_threads);
+    const std::size_t bump_reserve = bump_vec->capacity() / num_threads;
+    for (auto &v : thread_bump_vecs) {
+        v.reserve(bump_reserve);
+    }
     /* FIXME: make hasher.Set concurrent to remove this mutex */
     [[maybe_unused]] std::conditional_t<oneBitThresh, std::mutex, int> hash_mtx;
     std::vector<std::mutex> border_mutexes(num_threads - 1);
