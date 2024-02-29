@@ -466,12 +466,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     /* FIXME: decide if there's a better reserve size here */
-    /* FIXME: avoid false cache sharing through push_back on these vectors */
-    std::vector<BumpStorage> thread_bump_vecs(num_threads);
     const std::size_t bump_reserve = bump_vec->capacity() / num_threads;
-    for (auto &v : thread_bump_vecs) {
-        v.reserve(bump_reserve);
-    }
     /* FIXME: make hasher.Set concurrent to remove this mutex */
     [[maybe_unused]] std::conditional_t<oneBitThresh, std::mutex, int> hash_mtx;
     std::vector<std::mutex> border_mutexes(num_threads - 1);
@@ -480,11 +475,19 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     if constexpr (kBucketSearchRange > 0) {
         bs->SetNumThreads(num_threads);
     }
+    /* used for synchronizing the search for the bucket in which to bump between threads */
     [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::mutex> search_mtx;
     [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::condition_variable> search_cv;
     [[maybe_unused]] std::size_t search_rem = num_threads;
+    /* used for synchronizing the copying of the local bump vectors into the global bump vector */
+    std::mutex vec_mtx;
+    std::condition_variable vec_cv;
+    std::size_t vec_rem = num_threads;
+    std::vector<std::size_t> bump_vec_start_pos(num_threads + 1);
     for (std::size_t ti = 0; ti < num_threads; ++ti) {
         threads.emplace_back([&, ti]() {
+            BumpStorage local_bump_vec;
+            local_bump_vec.reserve(bump_reserve);
             Index start_bucket = ti * buckets_per_thread;
             if (start_bucket >= num_buckets)
                 return;
@@ -738,7 +741,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                                            ? hasher.GetResultRowFromHash(hash)
                                            : hasher.GetResultRowFromInput(*(begin + idx)))
                          << std::dec;
-                    thread_bump_vecs[ti].push_back(*(begin + idx));
+                    local_bump_vec.push_back(*(begin + idx));
                     continue;
                 } else if (cval != last_cval) {
                     // clear bump cache
@@ -798,10 +801,10 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                             all_good = false;
 
                             // bump all items with the same uncompressed value
-                            do_bump(thread_bump_vecs[ti], unc_bump_cache);
+                            do_bump(local_bump_vec, unc_bump_cache);
                             sLOG << "Also bumping"
                                  << tlx::wrap_unprintable(*(begin + idx));
-                            thread_bump_vecs[ti].push_back(*(begin + idx));
+                            local_bump_vec.push_back(*(begin + idx));
                             // proceed to next item, don't do regular bumping (but only
                             // if cval == 2, not generally!)
                             continue;
@@ -810,8 +813,8 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                     bs->SetMeta(bucket, thresh);
                     all_good = false;
 
-                    do_bump(thread_bump_vecs[ti], bump_cache);
-                    thread_bump_vecs[ti].push_back(*(begin + idx));
+                    do_bump(local_bump_vec, bump_cache);
+                    local_bump_vec.push_back(*(begin + idx));
                 } else {
                     sLOG << "Insertion succeeded of item"
                          << tlx::wrap_unprintable(*(begin + idx)) << "in pos" << row
@@ -860,7 +863,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                     for (Index i = end_index; i < static_cast<Index>(num_items); ++i) {
                         if (end_bucket + bump_buckets < Hasher::GetBucket(std::get<0>(input[i])))
                             break;
-                        thread_bump_vecs[ti].push_back(*(begin + std::get<1>(input[i])));
+                        local_bump_vec.push_back(*(begin + std::get<1>(input[i])));
                     }
                 }
             }
@@ -870,30 +873,26 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
             if (start_locked) {
                 border_mutexes[ti - 1].unlock();
             }
-        });
-    }
-    for (auto& thread : threads) {
-        thread.join();
-    }
-    /* FIXME: It would be ideal to have this copying as part of the parallel processing
-       above (only protect the resizing of bump_vec, but not the copying), but that's
-       problematic because the total size of bump_vec is not known before, so it might
-       happen that the internal storage is reallocated while a different thread is
-       copying to that storage, leading to undefined behavior. At least I think that
-       would be problematic, but I need to think about it a bit more. */
-    std::vector<std::size_t> start_pos(num_threads);
-    start_pos[0] = bump_vec->size();
-    for (std::size_t i = 0; i < num_threads - 1; ++i) {
-        start_pos[i + 1] = start_pos[i] + thread_bump_vecs[i].size();
-    }
-    bump_vec->resize(start_pos[num_threads - 1] + thread_bump_vecs[num_threads - 1].size());
-    threads.clear();
-    for (std::size_t ti = 0; ti < num_threads; ++ti) {
-        threads.emplace_back([&, ti]() {
+            bump_vec_start_pos[ti + 1] = local_bump_vec.size();
+            {
+                std::unique_lock l(vec_mtx);
+                --vec_rem;
+                if (vec_rem > 0) {
+                    vec_cv.wait(l);
+                } else {
+                    /* I guess this is probably always 0 anyways */
+                    bump_vec_start_pos[0] = bump_vec->size();
+                    for (std::size_t i = 0; i < num_threads; ++i) {
+                        bump_vec_start_pos[i + 1] += bump_vec_start_pos[i];
+                    }
+                    bump_vec->resize(bump_vec_start_pos[num_threads]);
+                    vec_cv.notify_all();
+                }
+            }
             std::copy(
-                thread_bump_vecs[ti].begin(),
-                thread_bump_vecs[ti].end(),
-                bump_vec->begin() + start_pos[ti]
+                local_bump_vec.begin(),
+                local_bump_vec.end(),
+                bump_vec->begin() + bump_vec_start_pos[ti]
             );
         });
     }
