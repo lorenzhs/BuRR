@@ -96,11 +96,7 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
     constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U);
     constexpr auto kResultBits = static_cast<Index>(sizeof(ResultRow) * 8U);
     constexpr Index kMinBucketsPerThread = BandingStorage::kMinBucketsPerThread;
-    constexpr bool kBumpWholeBucket = BandingStorage::kBumpWholeBucket;
     constexpr Index kBucketSearchRange = BandingStorage::kBucketSearchRange;
-    constexpr Index kBucketSize = BandingStorage::kBucketSize;
-    [[maybe_unused]] constexpr Index bump_buckets =
-        kCoeffBits <= 1 ? 1 : (kCoeffBits - 1 + kBucketSize - 1) / kBucketSize;
 
     const Index num_starts = bs.GetNumStarts();
     const Index num_buckets = bs.GetNumBuckets();
@@ -142,30 +138,18 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
             if constexpr (kBucketSearchRange > 0) {
                 if (ti < num_threads - 1) {
                     end_bucket = bs.GetThreadBorderBucket(ti);
-                    if constexpr (kBumpWholeBucket) {
-                        end_bucket += bump_buckets;
-                    }
                 }
                 if (ti > 0) {
                     start_bucket = bs.GetThreadBorderBucket(ti - 1);
-                    if constexpr (kBumpWholeBucket) {
-                        start_bucket += bump_buckets;
-                    }
                 }
             }
             Index start_slot, end_slot;
-            if constexpr (kBumpWholeBucket) {
-                start_slot = start_bucket * BandingStorage::kBucketSize;
-                /* NOTE: For the last thread, end_bucket * kBucketSize may actually be less than num_slots */
-                end_slot = end_bucket >= num_buckets ? num_slots : end_bucket * BandingStorage::kBucketSize;
-            } else {
-                start_slot = ti == 0
-                                       ? start_bucket * BandingStorage::kBucketSize
-                                       : start_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
-                end_slot = end_bucket >= num_buckets
-                                     ? num_slots
-                                     : end_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
-            }
+            start_slot = ti == 0
+                                   ? start_bucket * BandingStorage::kBucketSize
+                                   : start_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
+            end_slot = end_bucket >= num_buckets
+                                 ? num_slots
+                                 : end_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
             [[maybe_unused]] Index safe_end = 0;
             [[maybe_unused]] Index safe_start = 0;
             if constexpr (BandingStorage::kUseCacheLineStorage) {
@@ -367,11 +351,7 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
     constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U),
                    kResultBits = SolutionStorage::kResultBits;
     constexpr Index kMinBucketsPerThread = BandingStorage::kMinBucketsPerThread;
-    constexpr bool kBumpWholeBucket = BandingStorage::kBumpWholeBucket;
-    constexpr Index kBucketSize = BandingStorage::kBucketSize;
     constexpr Index kBucketSearchRange = BandingStorage::kBucketSearchRange;
-    [[maybe_unused]] constexpr Index bump_buckets =
-        kCoeffBits <= 1 ? 1 : (kCoeffBits - 1 + kBucketSize - 1) / kBucketSize;
 
     constexpr bool debug = false;
     const Index num_slots = bs.GetNumSlots();
@@ -423,31 +403,19 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
             if constexpr (kBucketSearchRange > 0) {
                 if (ti < num_threads - 1) {
                     end_bucket = bs.GetThreadBorderBucket(ti);
-                    if constexpr (kBumpWholeBucket) {
-                        end_bucket += bump_buckets;
-                    }
                 }
                 if (ti > 0) {
                     start_bucket = bs.GetThreadBorderBucket(ti - 1);
-                    if constexpr (kBumpWholeBucket) {
-                        start_bucket += bump_buckets;
-                    }
                 }
             }
 
             Index start_slot, end_slot;
-            if constexpr (kBumpWholeBucket) {
-                start_slot = start_bucket * BandingStorage::kBucketSize;
-                /* NOTE: For the last thread, end_bucket * kBucketSize may actually be less than num_slots */
-                end_slot = end_bucket >= num_buckets ? num_slots : end_bucket * BandingStorage::kBucketSize;
-            } else {
-                start_slot = ti == 0
-                                       ? start_bucket * BandingStorage::kBucketSize
-                                       : start_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
-                end_slot = end_bucket >= num_buckets
-                                     ? num_slots
-                                     : end_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
-            }
+            start_slot = ti == 0
+                                   ? start_bucket * BandingStorage::kBucketSize
+                                   : start_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
+            end_slot = end_bucket >= num_buckets
+                                 ? num_slots
+                                 : end_bucket * BandingStorage::kBucketSize + kCoeffBits - 1;
 
             Index start_block = start_slot / kCoeffBits;
             Index block = end_slot / kCoeffBits;

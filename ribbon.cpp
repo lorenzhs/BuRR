@@ -43,25 +43,17 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads) {
     std::iota(input.get(), input.get() + num_items, 0);
     LOG1 << "Input generation took " << timer.ElapsedNanos(true) / 1e6 << "ms";
 
-    ribbon_filter<depth, Config> rs(num_slots, slots_per_item, seed);
     ribbon_filter<depth, Config> r(num_slots, slots_per_item, seed);
 
     LOG1 << "Allocation took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
 
-    LOG1 << "Adding rows to filter....";
-    rs.AddRange(input.get(), input.get() + num_items, 0);
-    LOG1 << "Insertion took " << timer.ElapsedNanos(true) / 1e6 << "ms in total\n";
-
-    LOG1 << "Adding rows to filter (parallel, " << std::thread::hardware_concurrency() << " threads)....";
-    r.AddRange(input.get(), input.get() + num_items, std::thread::hardware_concurrency());
+    LOG1 << "Adding rows to filter (parallel, " << num_threads << " threads)....";
+    r.AddRange(input.get(), input.get() + num_items, num_threads);
     LOG1 << "Insertion took " << timer.ElapsedNanos(true) / 1e6 << "ms in total\n";
 
     input.reset();
 
-    rs.BackSubst();
-    LOG1 << "Backsubstitution (seq) took " << timer.ElapsedNanos(true) / 1e6
-         << "ms in total\n";
-    r.BackSubst(std::thread::hardware_concurrency());
+    r.BackSubst(num_threads);
     LOG1 << "Backsubstitution (par) took " << timer.ElapsedNanos(true) / 1e6
          << "ms in total\n";
 

@@ -100,8 +100,6 @@ constexpr unsigned thresh_meta_bits =
     [[maybe_unused]] static constexpr bool kUseMHC = RibbonConfig::kUseMHC;     \
     [[maybe_unused]] static constexpr bool kUseMultiplyShiftHash =              \
         RibbonConfig::kUseMultiplyShiftHash;                                    \
-    [[maybe_unused]] static constexpr bool kBumpWholeBucket =                   \
-        RibbonConfig::kBumpWholeBucket;                                         \
     [[maybe_unused]] static constexpr Index kBucketSearchRange =                \
         RibbonConfig::kBucketSearchRange;                                       \
     [[maybe_unused]] static constexpr BucketSearchMode kBucketSearchMode =      \
@@ -131,7 +129,7 @@ std::string dump_config() {
       << (kUseInterleavedSol ? "int" : (kUseCacheLineStorage ? "cls" : "basic"))
       << " fcao=" << kFirstCoeffAlwaysOne << " idxbits=" << 8u * sizeof(Index)
       << " keybits=" << 8u * sizeof(Key) << " filter=" << kIsFilter
-      << " minbpt=" << kMinBucketsPerThread << " bumpwhole=" << kBumpWholeBucket;
+      << " minbpt=" << kMinBucketsPerThread;
     return s.str();
 }
 
@@ -221,10 +219,6 @@ public:
     static constexpr bool kUseMHC = false;
     // Whether to print timings and other information about the construction.
     static constexpr bool log = true;
-    // Whether parallel insertion should bump a whole bucket between threads
-    // or just the minimum amount of items needed.
-    // Bumping the whole bucket is currently not supported when kBucketSearchRange > 0
-    static constexpr bool kBumpWholeBucket = false;
     // Number of buckets to search to find the bucket in which the
     // minimum number of elements needs to be bumped
     // (when using the parallel version)
