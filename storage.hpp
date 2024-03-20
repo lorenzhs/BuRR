@@ -58,6 +58,7 @@ public:
     }
     void Reset() {
         meta_.reset();
+        thread_borders_.reset();
     }
 
     /* FIXME: document that this is not clamped, i.e. should not be used by first/last thread */
@@ -176,18 +177,21 @@ public:
     inline Index GetNumBuckets() const { return num_buckets_; }
     // clang-format on
 
-    inline void SetNumThreads(std::size_t num_threads) {
-        thread_bucket_borders.resize(num_threads - 1);
+    inline void SetNumThreadBorders(std::size_t num_borders) {
+        thread_borders_ = std::make_unique<Index[]>(num_borders);
+        num_thread_borders_ = num_borders;
     }
 
     inline Index GetThreadBorderBucket(std::size_t t) const {
-        /* this uses .at so a wrong thread number given to
-           the back substitution is caught immediately */
-        return thread_bucket_borders.at(t);
+        if (t >= num_thread_borders_) {
+            std::cerr << "Wrong number of threads given to back substitution.\n";
+            abort();
+        }
+        return thread_borders_[t];
     }
 
     inline void SetThreadBorderBucket(std::size_t t, Index bucket) {
-        thread_bucket_borders[t] = bucket;
+        thread_borders_[t] = bucket;
     }
 
     size_t Size() const {
@@ -204,8 +208,10 @@ protected:
     // num_buckets_ is for debugging only & can be recomputed easily
     Index num_slots_ = 0, num_buckets_ = 0;
     std::unique_ptr<meta_t[]> meta_;
-    /* NOTE: This is only here temporarily while testing kBucketSearchRange */
-    std::vector<Index> thread_bucket_borders;
+    // this is only here so the back substitution can
+    // access the thread borders used for the insertion
+    std::unique_ptr<Index[]> thread_borders_;
+    std::size_t num_thread_borders_;
 };
 } // namespace
 
