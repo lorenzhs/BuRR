@@ -149,46 +149,64 @@ void ProcessInput(
     }
 }
 
-template <typename BandingStorage, typename Hasher, typename Iterator,
-          typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>, typename F, typename G>
-bool BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
-                     Iterator end, BumpStorage *bump_vec, F process_func, G sort_func) {
+/* 'parallel' is a separate template parameter so the parts that are not
+   relevant for the sequential version can be inside 'if constexpr (...)'. */
+/* The special types BorderMutexes and HashMutex only exist so no dummy
+   mutexes/vectors need to be created when calling the sequential version.
+   There's probably a nicer way to do this. */
+template <bool parallel, typename BandingStorage, typename Hasher, typename Iterator, typename Input,
+          typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>,
+          typename BorderMutexes, typename HashMutex>
+bool AddRangeInternal(
+    BandingStorage *bs, Hasher &hasher,
+    typename BandingStorage::Index start_bucket,
+    typename BandingStorage::Index end_bucket,
+    typename BandingStorage::Index start_index,
+    typename BandingStorage::Index end_index,
+    Input &input, Iterator begin, BumpStorage *bump_vec, std::size_t thread_index,
+    std::size_t num_threads, BorderMutexes &border_mutexes, HashMutex &hash_mtx) {
+
     using CoeffRow = typename BandingStorage::CoeffRow;
     using Index = typename BandingStorage::Index;
     using ResultRow = typename BandingStorage::ResultRow;
     using Hash = typename Hasher::Hash;
     constexpr bool kFCA1 = Hasher::kFirstCoeffAlwaysOne;
     constexpr bool oneBitThresh = Hasher::kThreshMode == ThreshMode::onebit;
+    [[maybe_unused]] constexpr Index kBucketSize = BandingStorage::kBucketSize;
+    [[maybe_unused]] constexpr Index kCoeffBits = BandingStorage::kCoeffBits;
 
     constexpr bool debug = false;
-    constexpr bool log = Hasher::log;
 
-    if (begin == end)
-        return true;
-
-    rocksdb::StopWatchNano timer(true);
-    const Index num_starts = bs->GetNumStarts();
-    const Index num_buckets = bs->GetNumBuckets();
-    sLOG << "Constructing ribbon with" << num_buckets
-         << "buckets,  num_starts = " << num_starts;
-
-    const auto num_items = end - begin; // std::distance(begin, end);
-#ifdef RIBBON_PASS_HASH
-    constexpr bool sparse = Hasher::kSparseCoeffs && Hasher::kCoeffBits < 128;
-    auto input = std::make_unique<
-        std::tuple<Index, Index, std::conditional_t<sparse, uint32_t, Hash>>[]>(
-        num_items);
-#else
-    auto input = std::make_unique<std::pair<Index, Index>[]>(num_items);
-#endif
-    {
-        sLOG << "Processing" << num_items << "items";
-        process_func(bs, hasher, input, begin, end);
+    [[maybe_unused]] Index safe_start_bucket;
+    [[maybe_unused]] Index safe_end_bucket;
+    if constexpr (parallel) {
+        safe_start_bucket = bs->GetNextSafeStart(start_bucket);
+        safe_end_bucket = bs->GetPrevSafeEnd(end_bucket);
     }
-    LOGC(log) << "\tInput transformation took "
-              << timer.ElapsedNanos(true) / 1e6 << "ms";
-    sort_func(input.get(), input.get() + num_items);
-    LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
+
+    Index last_bucket = start_bucket;
+    bool all_good = true;
+    Index thresh = Hasher::NoBumpThresh();
+    // Bump cache (row, input item) pairs that may have to be bumped retroactively
+    Index last_cval = -1;
+    std::vector<std::pair<Index, Index>> bump_cache;
+    // For 1-bit thresholds, we also need an uncompressed bump cache for undoing
+    // all insertions with the same uncompressed value if we end up in the
+    // "plus" case with a separately stored threshold
+    [[maybe_unused]] Index last_val = -1;
+    [[maybe_unused]] std::conditional_t<oneBitThresh, decltype(bump_cache), int> unc_bump_cache;
+    [[maybe_unused]] bool start_locked = false;
+    [[maybe_unused]] bool end_locked = false;
+    [[maybe_unused]] Index bump_start;
+    if constexpr (parallel) {
+        if (thread_index > 0) {
+            border_mutexes[thread_index - 1].lock();
+            start_locked = true;
+        }
+        bump_start = thread_index == 0
+                     ? start_bucket * BandingStorage::kBucketSize
+                     : start_bucket * BandingStorage::kBucketSize + BandingStorage::kCoeffBits - 1;
+    }
 
     const auto do_bump = [&](auto &vec) {
         sLOG << "Bumping" << vec.size() << "items";
@@ -202,49 +220,47 @@ bool BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
         vec.clear();
     };
 
-    Index last_bucket = 0;
-    bool all_good = true;
-    Index thresh = Hasher::NoBumpThresh();
-    // Bump cache (row, input item) pairs that may have to be bumped retroactively
-    Index last_cval = -1;
-    std::vector<std::pair<Index, Index>> bump_cache;
-    // For 1-bit thresholds, we also need an uncompressed bump cache for undoing
-    // all insertions with the same uncompressed value if we end up in the
-    // "plus" case with a separately stored threshold
-    [[maybe_unused]] Index last_val = -1;
-    [[maybe_unused]] std::conditional_t<oneBitThresh, decltype(bump_cache), int> unc_bump_cache;
-
 #ifndef RIBBON_PASS_HASH
-    auto next = *(begin + input[0].second);
+    auto next = *(begin + input[start_index].second);
 #endif
 
-    for (Index i = 0; i < static_cast<Index>(num_items); ++i) {
+    for (Index i = start_index; i < end_index; ++i) {
 #ifdef RIBBON_PASS_HASH
         const auto [sortpos, idx, hash] = input[i];
 #else
         const auto [sortpos, idx] = input[i];
 #endif
         const Index start = Hasher::SortToStart(sortpos),
-                    bucket = Hasher::GetBucket(sortpos),
                     val = Hasher::GetIntraBucket(sortpos),
-                    cval = hasher.Compress(val);
+                    cval = hasher.Compress(val),
+                    bucket = Hasher::GetBucket(sortpos);
         assert(bucket >= last_bucket);
         assert(oneBitThresh || cval < Hasher::NoBumpThresh());
 
 #ifndef RIBBON_PASS_HASH
         const Hash hash = hasher.GetHash(next);
-        if (i + 1 < num_items)
+        if (i + 1 < end_index)
             next = *(begin + input[i + 1].second);
 
         // prefetch the cache miss far in advance, assuming the iterator
         // is to contiguous storage
-        if (TLX_LIKELY(i + 32 < num_items))
+        if (TLX_LIKELY(i + 32 < end_index))
             __builtin_prefetch(&*begin + input[i + 32].second, 0, 1);
 #endif
 
         if (bucket != last_bucket) {
             // moving to next bucket
             sLOG << "Moving to bucket" << bucket << "was" << last_bucket;
+            if constexpr (parallel) {
+                if (thread_index > 0 && last_bucket < safe_start_bucket && bucket >= safe_start_bucket) {
+                    border_mutexes[thread_index - 1].unlock();
+                    start_locked = false;
+                }
+                if (thread_index < num_threads - 1 && last_bucket <= safe_end_bucket && bucket > safe_end_bucket) {
+                    border_mutexes[thread_index].lock();
+                    end_locked = true;
+                }
+            }
             if constexpr (oneBitThresh) {
                 unc_bump_cache.clear();
                 last_val = val;
@@ -291,12 +307,36 @@ bool BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
                                  ? hasher.GetResultRowFromHash(hash)
                                  : hasher.GetResultRowFromInput(*(begin + idx));
 
-        auto [success, row] = BandingAdd<kFCA1>(bs, start, cr, rr);
+        /* The first kCoeffBits-1 rows of the first bucket are bumped in the parallel case */
+        bool success;
+        Index row;
+        if constexpr (parallel) {
+            std::tie(success, row) = start < bump_start
+                                  ? std::make_pair(false, start)
+                                  : BandingAdd<kFCA1>(bs, start, cr, rr);
+        } else {
+            std::tie(success, row) = BandingAdd<kFCA1>(bs, start, cr, rr);
+        }
+        /*
+        const auto [success, row] = [&]() {
+            if constexpr (parallel) {
+                return start < bump_start
+                       ? std::make_pair(false, start)
+                       : BandingAdd<kFCA1>(bs, start, cr, rr);
+            } else {
+                return BandingAdd<kFCA1>(bs, start, cr, rr);
+            }
+        }();
+        */
+
         if (!success) {
             assert(all_good);
-            if (bump_vec == nullptr)
+            if constexpr (!parallel) {
                 // bumping disabled, abort!
-                return false;
+                if (bump_vec == nullptr) {
+                    return false;
+                }
+            }
             // if we got this far, this is the first failure in this bucket,
             // and we need to undo insertions with the same cval
             sLOG << "First failure in bucket" << bucket << "val" << val
@@ -310,7 +350,12 @@ bool BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
                     sLOG << "First failure in bucket" << bucket << "val" << val
                          << "is a 'plus' case (below threshold)";
                     // "plus" case: store uncompressed threshold in hash table
-                    hasher.Set(bucket, val);
+                    if constexpr (parallel) {
+                        std::scoped_lock lock(hash_mtx);
+                        hasher.Set(bucket, val);
+                    } else {
+                        hasher.Set(bucket, val);
+                    }
                     // Set meta to 0 (some bumpage) but keep thresh at 2 so that
                     // we don't retroactively bump everything when moving to the
                     // next bucket
@@ -349,6 +394,63 @@ bool BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
     if (thresh == Hasher::NoBumpThresh()) {
         bs->SetMeta(last_bucket, thresh);
     }
+
+    if constexpr (parallel) {
+        if (end_locked) {
+            border_mutexes[thread_index].unlock();
+        }
+        if (start_locked) {
+            border_mutexes[thread_index - 1].unlock();
+        }
+    }
+
+    return true;
+}
+
+template <typename BandingStorage, typename Hasher, typename Iterator,
+          typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>, typename F, typename G>
+bool BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
+                     Iterator end, BumpStorage *bump_vec, F process_func, G sort_func) {
+    using Index = typename BandingStorage::Index;
+    constexpr bool oneBitThresh = Hasher::kThreshMode == ThreshMode::onebit;
+
+    constexpr bool debug = false;
+    constexpr bool log = Hasher::log;
+
+    if (begin == end)
+        return true;
+
+    rocksdb::StopWatchNano timer(true);
+    const Index num_starts = bs->GetNumStarts();
+    const Index num_buckets = bs->GetNumBuckets();
+    sLOG << "Constructing ribbon with" << num_buckets
+         << "buckets,  num_starts = " << num_starts;
+
+    const auto num_items = end - begin; // std::distance(begin, end);
+#ifdef RIBBON_PASS_HASH
+    constexpr bool sparse = Hasher::kSparseCoeffs && Hasher::kCoeffBits < 128;
+    auto input = std::make_unique<
+        std::tuple<Index, Index, std::conditional_t<sparse, uint32_t, Hash>>[]>(
+        num_items);
+#else
+    auto input = std::make_unique<std::pair<Index, Index>[]>(num_items);
+#endif
+    {
+        sLOG << "Processing" << num_items << "items";
+        process_func(bs, hasher, input, begin, end);
+    }
+    LOGC(log) << "\tInput transformation took "
+              << timer.ElapsedNanos(true) / 1e6 << "ms";
+    sort_func(input.get(), input.get() + num_items);
+    LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
+
+    int dummyval = 0;
+    bool success = AddRangeInternal<false>(
+        bs, hasher, 0, num_buckets, 0, num_items, input,
+        begin, bump_vec, 0, 0, dummyval, dummyval
+    );
+    if (!success)
+        return false;
 
     // migrate thresholds to hash table
     if constexpr (oneBitThresh) {
@@ -476,11 +578,7 @@ template <typename BandingStorage, typename Hasher, typename Iterator,
           typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
 bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                      Iterator end, BumpStorage *bump_vec, std::size_t num_threads) {
-    using CoeffRow = typename BandingStorage::CoeffRow;
     using Index = typename BandingStorage::Index;
-    using ResultRow = typename BandingStorage::ResultRow;
-    using Hash = typename Hasher::Hash;
-    constexpr bool kFCA1 = Hasher::kFirstCoeffAlwaysOne;
     constexpr bool oneBitThresh = Hasher::kThreshMode == ThreshMode::onebit;
     constexpr Index kMinBucketsPerThread = BandingStorage::kMinBucketsPerThread;
     constexpr Index kBucketSize = BandingStorage::kBucketSize;
@@ -565,18 +663,6 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     sort_parallel(input.get(), input.get() + num_items);
     LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
 
-    const auto do_bump = [&](auto &thread_bump_vec, auto &vec) {
-        sLOG << "Bumping" << vec.size() << "items";
-        for (auto [row, idx] : vec) {
-            sLOG << "\tBumping row" << row << "item"
-                 << tlx::wrap_unprintable(*(begin + idx));
-            bs->SetCoeffs(row, 0);
-            bs->SetResult(row, 0);
-            thread_bump_vec.push_back(*(begin + idx));
-        }
-        vec.clear();
-    };
-
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     /* FIXME: decide if there's a better reserve size here */
@@ -585,7 +671,6 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     [[maybe_unused]] std::conditional_t<oneBitThresh, std::mutex, int> hash_mtx;
     std::vector<std::mutex> border_mutexes(num_threads - 1);
     [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::vector<Index>> thread_ends(num_threads - 1);
-    [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::vector<Index>> thread_starts(num_threads - 1);
     if constexpr (kBucketSearchRange > 0) {
         bs->SetNumThreadBorders(num_threads);
     }
@@ -636,8 +721,6 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                         hasher, start_bucket, start_index, end_index, [&input](Index i){return std::get<0>(input[i]);}
                     );
                     bs->SetThreadBorderBucket(ti - 1, min_bucket);
-                    /* FIXME: isn't this just duplicated? */
-                    thread_starts[ti - 1] = min_bucket_start;
                     thread_ends[ti - 1] = min_bucket_start;
                 }
                 {
@@ -658,188 +741,15 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                 }
                 if (ti > 0) {
                     start_bucket = bs->GetThreadBorderBucket(ti - 1);
-                    start_index = thread_starts[ti - 1];
+                    start_index = thread_ends[ti - 1];
                 }
             }
 
-            Index safe_start_bucket = bs->GetNextSafeStart(start_bucket);
-            Index safe_end_bucket = bs->GetPrevSafeEnd(end_bucket);
+            AddRangeInternal<true>(
+                bs, hasher, start_bucket, end_bucket, start_index, end_index, input,
+                begin, &local_bump_vec, ti, num_threads, border_mutexes, hash_mtx
+            );
 
-            Index last_bucket = start_bucket;
-            bool all_good = true;
-            Index thresh = Hasher::NoBumpThresh();
-            // Bump cache (row, input item) pairs that may have to be bumped retroactively
-            Index last_cval = -1;
-            std::vector<std::pair<Index, Index>> bump_cache;
-            // For 1-bit thresholds, we also need an uncompressed bump cache for undoing
-            // all insertions with the same uncompressed value if we end up in the
-            // "plus" case with a separately stored threshold
-            [[maybe_unused]] Index last_val = -1;
-            [[maybe_unused]] std::conditional_t<oneBitThresh, decltype(bump_cache), int> unc_bump_cache;
-            bool start_locked = false;
-            bool end_locked = false;
-            if (ti > 0) {
-                border_mutexes[ti - 1].lock();
-                start_locked = true;
-            }
-            [[maybe_unused]] Index bump_start = ti == 0
-                                   ? start_bucket * BandingStorage::kBucketSize
-                                   : start_bucket * BandingStorage::kBucketSize + BandingStorage::kCoeffBits - 1;
-
-#ifndef RIBBON_PASS_HASH
-            auto next = *(begin + input[start_index].second);
-#endif
-
-            for (Index i = start_index; i < end_index; ++i) {
-#ifdef RIBBON_PASS_HASH
-                const auto [sortpos, idx, hash] = input[i];
-#else
-                const auto [sortpos, idx] = input[i];
-#endif
-                const Index start = Hasher::SortToStart(sortpos),
-                            val = Hasher::GetIntraBucket(sortpos),
-                            cval = hasher.Compress(val),
-                            bucket = Hasher::GetBucket(sortpos);
-                assert(bucket >= last_bucket);
-                assert(oneBitThresh || cval < Hasher::NoBumpThresh());
-
-#ifndef RIBBON_PASS_HASH
-                const Hash hash = hasher.GetHash(next);
-                if (i + 1 < num_items)
-                    next = *(begin + input[i + 1].second);
-
-                // prefetch the cache miss far in advance, assuming the iterator
-                // is to contiguous storage
-                if (TLX_LIKELY(i + 32 < num_items))
-                    __builtin_prefetch(&*begin + input[i + 32].second, 0, 1);
-#endif
-
-                if (bucket != last_bucket) {
-                    // moving to next bucket
-                    sLOG << "Moving to bucket" << bucket << "was" << last_bucket;
-                    if (ti > 0 && last_bucket < safe_start_bucket && bucket >= safe_start_bucket) {
-                        border_mutexes[ti - 1].unlock();
-                        start_locked = false;
-                    }
-                    if (ti < num_threads - 1 && last_bucket <= safe_end_bucket && bucket > safe_end_bucket) {
-                        border_mutexes[ti].lock();
-                        end_locked = true;
-                    }
-                    if constexpr (oneBitThresh) {
-                        unc_bump_cache.clear();
-                        last_val = val;
-                    }
-                    if (thresh == Hasher::NoBumpThresh()) {
-                        sLOG << "Bucket" << last_bucket << "has no bumped items";
-                        bs->SetMeta(last_bucket, thresh);
-                    }
-                    all_good = true;
-                    last_bucket = bucket;
-                    thresh = Hasher::NoBumpThresh(); // maximum == "no bumpage"
-                    last_cval = cval;
-                    bump_cache.clear();
-                } else if (!all_good) {
-                    // direct hard bump
-                    sLOG << "Directly bumping" << tlx::wrap_unprintable(*(begin + idx))
-                         << "from bucket" << bucket << "val" << val << cval << "start"
-                         << start << "sort" << sortpos << "hash" << std::hex << hash
-                         << "data"
-                         << (uint64_t)(Hasher::kIsFilter
-                                           ? hasher.GetResultRowFromHash(hash)
-                                           : hasher.GetResultRowFromInput(*(begin + idx)))
-                         << std::dec;
-                    local_bump_vec.push_back(*(begin + idx));
-                    continue;
-                } else if (cval != last_cval) {
-                    // clear bump cache
-                    sLOG << "Bucket" << bucket << "cval" << cval << "!=" << last_cval;
-                    bump_cache.clear();
-                    last_cval = cval;
-                }
-                if constexpr (oneBitThresh) {
-                    // split into constexpr and normal if because unc_bump_cache isn't a
-                    // vector if !oneBitThresh
-                    if (val != last_val) {
-                        unc_bump_cache.clear();
-                        last_val = val;
-                    }
-                }
-
-
-                const CoeffRow cr = hasher.GetCoeffs(hash);
-                const ResultRow rr = Hasher::kIsFilter
-                                         ? hasher.GetResultRowFromHash(hash)
-                                         : hasher.GetResultRowFromInput(*(begin + idx));
-
-                /* The first kCoeffBits rows of the first bucket are bumped */
-                const auto [success, row] = start < bump_start
-                                          ? std::make_pair(false, start)
-                                          : BandingAdd<kFCA1>(bs, start, cr, rr);
-
-                if (!success) {
-                    assert(all_good);
-                    // if we got this far, this is the first failure in this bucket,
-                    // and we need to undo insertions with the same cval
-                    sLOG << "First failure in bucket" << bucket << "val" << val
-                         << "start" << start << "sort" << sortpos << "hash" << std::hex
-                         << hash << "data" << (uint64_t)rr << std::dec << "for item"
-                         << tlx::wrap_unprintable(*(begin + idx)) << "-> threshold"
-                         << cval << "clash in row" << row;
-                    thresh = cval;
-                    if constexpr (oneBitThresh) {
-                        if (cval == 2) {
-                            sLOG << "First failure in bucket" << bucket << "val" << val
-                                 << "is a 'plus' case (below threshold)";
-                            // "plus" case: store uncompressed threshold in hash table
-                            {
-                                std::scoped_lock lock(hash_mtx);
-                                hasher.Set(bucket, val);
-                            }
-                            // Set meta to 0 (some bumpage) but keep thresh at 2 so that
-                            // we don't retroactively bump everything when moving to the
-                            // next bucket
-                            bs->SetMeta(bucket, 0);
-                            all_good = false;
-
-                            // bump all items with the same uncompressed value
-                            do_bump(local_bump_vec, unc_bump_cache);
-                            sLOG << "Also bumping"
-                                 << tlx::wrap_unprintable(*(begin + idx));
-                            local_bump_vec.push_back(*(begin + idx));
-                            // proceed to next item, don't do regular bumping (but only
-                            // if cval == 2, not generally!)
-                            continue;
-                        }
-                    }
-                    bs->SetMeta(bucket, thresh);
-                    all_good = false;
-
-                    do_bump(local_bump_vec, bump_cache);
-                    local_bump_vec.push_back(*(begin + idx));
-                } else {
-                    sLOG << "Insertion succeeded of item"
-                         << tlx::wrap_unprintable(*(begin + idx)) << "in pos" << row
-                         << "bucket" << bucket << "val" << val << cval << "start"
-                         << start << "sort" << sortpos << "hash" << std::hex << hash
-                         << "data" << (uint64_t)rr << std::dec;
-                    bump_cache.emplace_back(row, idx);
-                    if constexpr (oneBitThresh) {
-                        // also record in bump cache for uncompressed values
-                        unc_bump_cache.emplace_back(row, idx);
-                    }
-                }
-            }
-            // set final threshold
-            if (thresh == Hasher::NoBumpThresh()) {
-                bs->SetMeta(last_bucket, thresh);
-            }
-
-            if (end_locked) {
-                border_mutexes[ti].unlock();
-            }
-            if (start_locked) {
-                border_mutexes[ti - 1].unlock();
-            }
             bump_vec_start_pos[ti + 1] = local_bump_vec.size();
             {
                 std::unique_lock l(vec_mtx);
