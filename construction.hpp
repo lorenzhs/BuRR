@@ -122,13 +122,13 @@ __attribute__((noinline)) void my_sort(Iterator begin, Iterator end,
 
 template <typename BandingStorage, typename Hasher, typename Iterator, typename Input>
 void ProcessInput(
-    Hasher &hasher, Input &input, Iterator begin,
+    BandingStorage *bs, Hasher &hasher, Input &input, Iterator begin,
     typename BandingStorage::Index start_idx,
-    typename BandingStorage::Index end_idx,
-    typename BandingStorage::Index num_starts) {
+    typename BandingStorage::Index end_idx) {
 
     using Index = typename BandingStorage::Index;
     using Hash = typename Hasher::Hash;
+    const Index num_starts = bs->GetNumStarts();
 #ifdef RIBBON_PASS_HASH
     constexpr bool sparse = Hasher::kSparseCoeffs && Hasher::kCoeffBits < 128;
 #endif
@@ -150,9 +150,9 @@ void ProcessInput(
 }
 
 template <typename BandingStorage, typename Hasher, typename Iterator,
-          typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
-bool BandingAddRange(BandingStorage *bs, Hasher &hasher, Iterator begin,
-                     Iterator end, BumpStorage *bump_vec) {
+          typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>, typename F, typename G>
+bool BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
+                     Iterator end, BumpStorage *bump_vec, F process_func, G sort_func) {
     using CoeffRow = typename BandingStorage::CoeffRow;
     using Index = typename BandingStorage::Index;
     using ResultRow = typename BandingStorage::ResultRow;
@@ -181,14 +181,13 @@ bool BandingAddRange(BandingStorage *bs, Hasher &hasher, Iterator begin,
 #else
     auto input = std::make_unique<std::pair<Index, Index>[]>(num_items);
 #endif
-
     {
         sLOG << "Processing" << num_items << "items";
-        ProcessInput<BandingStorage>(hasher, input, begin, 0, num_items, num_starts);
+        process_func(bs, hasher, input, begin, end);
     }
     LOGC(log) << "\tInput transformation took "
               << timer.ElapsedNanos(true) / 1e6 << "ms";
-    my_sort(input.get(), input.get() + num_items);
+    sort_func(input.get(), input.get() + num_items);
     LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
 
     const auto do_bump = [&](auto &vec) {
@@ -361,6 +360,17 @@ bool BandingAddRange(BandingStorage *bs, Hasher &hasher, Iterator begin,
     return true;
 }
 
+template <typename BandingStorage, typename Hasher, typename Iterator,
+          typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
+bool BandingAddRange(BandingStorage *bs, Hasher &hasher, Iterator begin,
+                     Iterator end, BumpStorage *bump_vec) {
+    return BandingAddRangeBase(bs, hasher, begin, end, bump_vec,
+        [&](BandingStorage *bs, Hasher &hasher, auto &input, Iterator begin, Iterator end) {
+        const auto num_items = end - begin;
+        ProcessInput(bs, hasher, input, begin, 0, num_items);
+        }, [](auto begin, auto end){my_sort(begin, end);});
+}
+
 template <typename BandingStorage, typename Hasher, typename F>
 std::pair<typename BandingStorage::Index, typename BandingStorage::Index> FindBumpBucket(
     Hasher &hasher,
@@ -481,6 +491,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
         kCoeffBits <= 1 ? 1 : (kCoeffBits - 1 + kBucketSize - 1) / kBucketSize;
     /* less than this wouldn't really make sense */
     static_assert(kMinBucketsPerThread >= 1 + bump_buckets);
+    assert(num_threads > 0);
 
     constexpr bool debug = false;
     constexpr bool log = Hasher::log;
@@ -488,25 +499,47 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     if (begin == end)
         return true;
 
-    if (!bump_vec)
-        return BandingAddRange(bs, hasher, begin, end, bump_vec);
+    /* These two lambdas are used to still perform the preprocessing and sorting in
+       parallel even when the sequential insertion is used (i.e. when we are in the
+       base case ribbon or there are too few slots) */
+    /* this uses the original number of threads before it is possibly reduced */
+    const auto process_input = [num_threads](BandingStorage *bs, Hasher &hasher, auto &input, Iterator begin, Iterator end) {
+        const auto num_items = end - begin;
+        std::size_t items_per_thread = (num_items + num_threads - 1) / num_threads;
+        std::vector<std::thread> threads;
+        threads.reserve(num_threads);
+        for (std::size_t ti = 0; ti < num_threads; ++ti) {
+            threads.emplace_back([&, ti]() {
+                Index start_idx = static_cast<Index>(ti * items_per_thread);
+                Index end_idx = static_cast<Index>(std::min((ti + 1) * items_per_thread, static_cast<std::size_t>(num_items)));
+                ProcessInput(bs, hasher, input, begin, start_idx, end_idx);
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+    };
+    const auto sort_parallel = [num_threads](auto begin, auto end) {
+        my_sort_parallel(begin, end, num_threads);
+    };
+
+    if (!bump_vec) {
+        return BandingAddRangeBase(bs, hasher, begin, end, bump_vec, process_input, sort_parallel);
+    }
 
     rocksdb::StopWatchNano timer(true);
     const Index num_starts = bs->GetNumStarts();
     const Index num_buckets = bs->GetNumBuckets();
 
-    std::size_t orig_num_threads = num_threads;
     /* NOTE: Here, we round down in order to make sure that all threads
        get at least kMinBucketsPerThread buckets. Below, we round up
        for the actual distribution. */
-    /* FIXME: should num_threads be a power of 2? */
     std::size_t buckets_per_thread = num_buckets / num_threads;
     if (buckets_per_thread < kMinBucketsPerThread) {
         num_threads = num_buckets / kMinBucketsPerThread;
-        assert(num_threads < orig_num_threads);
-        LOGC(log) << "reducing to " << num_threads << " threads.\n";
+        LOGC(log) << "reducing to " << num_threads << " threads.";
         if (num_threads <= 1)
-            return BandingAddRange(bs, hasher, begin, end, bump_vec);
+            return BandingAddRangeBase(bs, hasher, begin, end, bump_vec, process_input, sort_parallel);
     }
     buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
 
@@ -525,24 +558,11 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
 
     {
         sLOG << "Processing" << num_items << "items";
-
-        std::size_t items_per_thread = (num_items + num_threads - 1) / num_threads;
-        std::vector<std::thread> threads;
-        threads.reserve(orig_num_threads);
-        for (std::size_t ti = 0; ti < orig_num_threads; ++ti) {
-            threads.emplace_back([&, ti]() {
-                Index start_idx = static_cast<Index>(ti * items_per_thread);
-                Index end_idx = static_cast<Index>(std::min((ti + 1) * items_per_thread, static_cast<std::size_t>(num_items)));
-                ProcessInput<BandingStorage>(hasher, input, begin, start_idx, end_idx, num_starts);
-            });
-        }
-        for (auto& thread : threads) {
-            thread.join();
-        }
+        process_input(bs, hasher, input, begin, end);
     }
     LOGC(log) << "\tInput transformation took "
               << timer.ElapsedNanos(true) / 1e6 << "ms";
-    my_sort_parallel(input.get(), input.get() + num_items, orig_num_threads);
+    sort_parallel(input.get(), input.get() + num_items);
     LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
 
     const auto do_bump = [&](auto &thread_bump_vec, auto &vec) {

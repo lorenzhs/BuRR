@@ -576,7 +576,7 @@ public:
     std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
         (void)num_threads;
         // there's really no distinction in the base case
-        return AddRangeMHCInternal(begin, end);
+        return AddRangeMHCInternal(begin, end, num_threads);
     }
 
     // MHC version
@@ -584,7 +584,7 @@ public:
     std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
         (void)num_threads;
         auto input = Super::PrepareAddRangeMHC(begin, end);
-        return AddRangeMHCInternal(input.get(), input.get() + (end - begin));
+        return AddRangeMHCInternal(input.get(), input.get() + (end - begin), num_threads);
     }
 
     inline bool QueryFilter(const Key &key) const {
@@ -643,10 +643,10 @@ protected:
 
     // misnomer but needed for recursive construction
     template <typename Iterator>
-    bool AddRangeMHCInternal(Iterator begin, Iterator end) {
+    bool AddRangeMHCInternal(Iterator begin, Iterator end, std::size_t num_threads = 0) {
         bool success;
         do {
-            success = Super::AddRange(begin, end, nullptr);
+            success = Super::AddRange(begin, end, nullptr, num_threads);
             if (!success) {
                 // increase epsilon and try again
                 base_slots_per_item_ += 0.05;
