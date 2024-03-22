@@ -105,7 +105,7 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
        so there are no conflicts. */
     std::size_t buckets_per_thread = num_buckets / num_threads;
     if (buckets_per_thread < kMinBucketsPerThread) {
-        std::size_t orig_num_threads = num_threads;
+        [[maybe_unused]] std::size_t orig_num_threads = num_threads;
         num_threads = num_buckets / kMinBucketsPerThread;
         assert(num_threads < orig_num_threads);
         if (num_threads <= 1) {
@@ -373,7 +373,7 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
        so there are no conflicts. */
     std::size_t buckets_per_thread = num_buckets / num_threads;
     if (buckets_per_thread < kMinBucketsPerThread) {
-        std::size_t orig_num_threads = num_threads;
+        [[maybe_unused]] std::size_t orig_num_threads = num_threads;
         num_threads = num_buckets / kMinBucketsPerThread;
         assert(num_threads < orig_num_threads);
         if (num_threads <= 1) {
