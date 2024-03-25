@@ -164,6 +164,8 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
                     end_locked = true;
                 }
             }
+            /* FIXME: maybe only perform this check inside an assert() so it
+               is disabled with NDEBUG? */
             /* if this isn't the last thread, check if the necessary amount
                of empty rows is present for parallel processing to work
                (if the back substitution is called with the same amount of

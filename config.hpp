@@ -290,7 +290,6 @@ struct RConfig
                       : (recommended_bucket_size<coeff_bits, mode> << bucket_sh);
     static constexpr Index kMinBucketsPerThread =
         min_buckets_per_thread < 0 ? 200000 / kBucketSize : min_buckets_per_thread;
-    /* FIXME: change kUseMHC to true again after the parallel version of that is implemented */
     static constexpr bool kSparseCoeffs = sparse,
                           kUseInterleavedSol = interleaved,
                           kUseCacheLineStorage = cls, kUseMHC = false;

@@ -19,7 +19,7 @@ template <typename Index, bool IsFilter, bool sparse, typename ResultRow>
 void ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::do_sort(
     ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::data_t *begin,
     ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::data_t *end,
-    const ribbon::MinimalHasher<Index, sparse> &mh, Index num_starts) {
+    const ribbon::MinimalHasher<Index, sparse> &mh, Index num_starts, std::size_t num_threads) {
     using data_t = ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::data_t;
     auto KeyEx = [&mh, num_starts](const data_t &mhc) -> Index {
         const auto hash = mh.GetHash(mhc);
@@ -28,12 +28,21 @@ void ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::do_sort(
     };
 #ifdef RIBBON_USE_STD_SORT
     // Use std::sort as a slow fallback
-    std::sort(begin, end, [&KeyEx](const auto &a, const auto &b) {
-        return KeyEx(a) < KeyEx(b);
-    });
+    if (num_threads <= 1) {
+        std::sort(begin, end, [&KeyEx](const auto &a, const auto &b) {
+            return KeyEx(a) < KeyEx(b);
+        });
+    } else {
+        std::sort(std::execution::par_unseq, begin, end, [&KeyEx](const auto &a, const auto &b) {
+            return KeyEx(a) < KeyEx(b);
+        });
+    }
 #else
     // prioritise speed over compile time
-    ips2ra::sort(begin, end, KeyEx);
+    if (num_threads <= 1)
+        ips2ra::sort(begin, end, KeyEx);
+    else
+        ips2ra::parallel::sort(begin, end, KeyEx, num_threads);
 #endif
 }
 

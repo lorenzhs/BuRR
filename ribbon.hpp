@@ -150,9 +150,12 @@ public:
         rocksdb::StopWatchNano timer(true);
         bool success;
         if constexpr (kUseMHC) {
-            success = BandingAddRangeMHC(&storage_, hasher_, begin, end, bump_vec);
+            if (num_threads <= 1)
+                success = BandingAddRangeMHC(&storage_, hasher_, begin, end, bump_vec);
+            else
+                success = BandingAddRangeParallelMHC(&storage_, hasher_, begin, end, bump_vec, num_threads);
         } else {
-            if (num_threads == 0)
+            if (num_threads <= 1)
                 success = BandingAddRange(&storage_, hasher_, begin, end, bump_vec);
             else
                 success = BandingAddRangeParallel(&storage_, hasher_, begin, end, bump_vec, num_threads);
@@ -179,7 +182,7 @@ public:
             return;
         rocksdb::StopWatchNano timer(true);
         if constexpr (kUseInterleavedSol) {
-            if (num_threads == 0)
+            if (num_threads <= 1)
                 InterleavedBackSubst(storage_, &sol_);
             else
                 InterleavedBackSubstParallel(storage_, &sol_, num_threads);
@@ -188,7 +191,7 @@ public:
             storage_.Reset();
         } else if constexpr (kUseCacheLineStorage) {
             sol_.Prepare(storage_.GetNumSlots());
-            if (num_threads == 0)
+            if (num_threads <= 1)
                 SimpleBackSubst(storage_, &sol_);
             else
                 SimpleBackSubstParallel(storage_, &sol_, num_threads);
@@ -199,7 +202,7 @@ public:
             }
             storage_.Reset();
         } else {
-            if (num_threads == 0)
+            if (num_threads <= 1)
                 SimpleBackSubst(storage_, &storage_);
             else
                 SimpleBackSubstParallel(storage_, &storage_, num_threads);
@@ -301,19 +304,41 @@ protected:
     std::enable_if_t<C::kUseMHC,
                      std::unique_ptr<std::conditional_t<
                          kIsFilter, mhc_or_key_t, std::pair<mhc_or_key_t, ResultRow>>[]>>
-    PrepareAddRangeMHC(Iterator begin, Iterator end) {
+    PrepareAddRangeMHC(Iterator begin, Iterator end, std::size_t num_threads = 0) {
         // this is the top-level filter, transform from vector<Key> to vector<mhc_t>
         rocksdb::StopWatchNano timer(true);
         const auto input_size = end - begin;
         using value_type =
             std::conditional_t<kIsFilter, mhc_or_key_t, std::pair<mhc_or_key_t, ResultRow>>;
         auto input = std::make_unique<value_type[]>(input_size);
-        auto it = begin;
-        for (ssize_t i = 0; i < input_size; i++, ++it) {
-            if constexpr (kIsFilter)
-                input[i] = hasher_.GetMHC(*it);
-            else
-                input[i] = std::make_pair(hasher_.GetMHC(it->first), it->second);
+        if (num_threads <= 1) {
+            auto it = begin;
+            for (ssize_t i = 0; i < input_size; i++, ++it) {
+                if constexpr (kIsFilter)
+                    input[i] = hasher_.GetMHC(*it);
+                else
+                    input[i] = std::make_pair(hasher_.GetMHC(it->first), it->second);
+            }
+        } else {
+            std::size_t items_per_thread = (input_size + num_threads - 1) / num_threads;
+            std::vector<std::thread> threads;
+            threads.reserve(num_threads);
+            for (std::size_t ti = 0; ti < num_threads; ++ti) {
+                threads.emplace_back([&, ti]() {
+                    ssize_t start_idx = static_cast<ssize_t>(ti * items_per_thread);
+                    ssize_t end_idx = static_cast<ssize_t>(std::min((ti + 1) * items_per_thread, static_cast<std::size_t>(input_size)));
+                    auto it = begin + start_idx;
+                    for (ssize_t i = start_idx; i < end_idx; i++, ++it) {
+                        if constexpr (kIsFilter)
+                            input[i] = hasher_.GetMHC(*it);
+                        else
+                            input[i] = std::make_pair(hasher_.GetMHC(it->first), it->second);
+                    }
+                });
+            }
+            for (auto& thread : threads) {
+                thread.join();
+            }
         }
         LOGC(Config::log) << "MHC input transformation took "
                           << timer.ElapsedNanos() / 1e6 << "ms";
@@ -419,13 +444,11 @@ public:
                                       bumped_items.data() + bumped_items.size(), num_threads);
     }
 
-    /* FIXME: also parallelize MHC versions */
     // MHC version
     template <typename Iterator, typename C = Config>
     std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
-        (void)num_threads;
-        auto input = Super::PrepareAddRangeMHC(begin, end);
-        return AddRangeMHCInternal(input.get(), input.get() + (end - begin));
+        auto input = Super::PrepareAddRangeMHC(begin, end, num_threads);
+        return AddRangeMHCInternal(input.get(), input.get() + (end - begin), num_threads);
     }
 
     void BackSubst(std::size_t num_threads = 0) {
@@ -495,7 +518,8 @@ public:
 protected:
     template <typename C = Config, typename Iterator>
     std::enable_if_t<C::kUseMHC, bool> AddRangeMHCInternal(Iterator begin,
-                                                           Iterator end) {
+                                                           Iterator end,
+                                                           std::size_t num_threads = 0) {
         const auto input_size = end - begin;
         using value_type =
             std::conditional_t<kIsFilter, mhc_or_key_t, std::pair<mhc_or_key_t, ResultRow>>;
@@ -503,7 +527,7 @@ protected:
         bumped_items.reserve(std::max(
             0l, static_cast<ssize_t>((1 - slots_per_item_) * input_size)));
 
-        if (!Super::AddRange(begin, end, &bumped_items))
+        if (!Super::AddRange(begin, end, &bumped_items, num_threads))
             return false;
 
         if (bumped_items.size() == 0)
@@ -514,7 +538,7 @@ protected:
                      static_cast<size_t>(slots_per_item_ * bumped_items.size()));
         child_ribbon_.Prepare(child_slots);
         return child_ribbon_.AddRangeMHCInternal(
-            bumped_items.data(), bumped_items.data() + bumped_items.size());
+            bumped_items.data(), bumped_items.data() + bumped_items.size(), num_threads);
     }
 
     ribbon_filter<depth - 1, Config> child_ribbon_;
@@ -574,7 +598,6 @@ public:
 
     template <typename Iterator, typename C = Config>
     std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
-        (void)num_threads;
         // there's really no distinction in the base case
         return AddRangeMHCInternal(begin, end, num_threads);
     }
@@ -582,7 +605,6 @@ public:
     // MHC version
     template <typename Iterator, typename C = Config>
     std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
-        (void)num_threads;
         auto input = Super::PrepareAddRangeMHC(begin, end);
         return AddRangeMHCInternal(input.get(), input.get() + (end - begin), num_threads);
     }

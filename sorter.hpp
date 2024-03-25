@@ -16,6 +16,6 @@ public:
     using data_t =
         std::conditional_t<IsFilter, uint64_t, std::pair<uint64_t, ResultRow>>;
     void do_sort(data_t *begin, data_t *end, const MinimalHasher<Index, sparse> &mh,
-                 Index num_starts);
+                 Index num_starts, std::size_t num_threads = 0);
 };
 } // namespace ribbon
