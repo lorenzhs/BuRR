@@ -216,7 +216,7 @@ public:
     // Whether to use Master Hash Codes.  This causes keys to be hashed only
     // once during insertion and query, using hash remixing to derive the next
     // level's hash if the key was bumped.  This is almost always a good idea.
-    static constexpr bool kUseMHC = false;
+    static constexpr bool kUseMHC = true;
     // Whether to print timings and other information about the construction.
     static constexpr bool log = true;
     // Number of buckets to search to find the bucket in which the
@@ -292,7 +292,7 @@ struct RConfig
         min_buckets_per_thread < 0 ? 200000 / kBucketSize : min_buckets_per_thread;
     static constexpr bool kSparseCoeffs = sparse,
                           kUseInterleavedSol = interleaved,
-                          kUseCacheLineStorage = cls, kUseMHC = false;
+                          kUseCacheLineStorage = cls, kUseMHC = true;
 };
 
 /******************************************************************************/
