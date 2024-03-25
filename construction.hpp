@@ -12,6 +12,7 @@
 
 #include <tlx/logger.hpp>
 #include <tlx/logger/wrap_unprintable.hpp>
+#include <tlx/define/likely.hpp>
 
 #ifndef RIBBON_USE_STD_SORT
 // Use in-place super-scalar radix sorter ips2ra, which is around 3x faster for
