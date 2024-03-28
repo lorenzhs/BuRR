@@ -12,28 +12,28 @@ all: ribbon
 sorter.o: sorter.cpp sorter.hpp minimal_hasher.hpp
 	$(CXX) $(OPTFLAGS) $(CFLAGS) -Wno-unused-function -c -o $@ $<
 
-bench:	sorter.o ribbon.cpp *.hpp rocksdb/*.h tlx Makefile
+bench:	sorter.o ribbon.cpp *.hpp rocksdb/*.h libtlx Makefile
 	$(CXX) $(OPTFLAGS) $(BITS) $(CFLAGS) -o bench$(RIBBON_BITS) ribbon.cpp $(LDFLAGS)
 
-ribbon:	sorter.o ribbon.cpp *.hpp rocksdb/*.h tlx Makefile
+ribbon:	sorter.o ribbon.cpp *.hpp rocksdb/*.h libtlx Makefile
 	$(CXX) $(DEFFLAGS) $(BITS) $(CFLAGS) -o ribbon$(RIBBON_BITS) ribbon.cpp $(LDFLAGS)
 
-debug:	sorter.o ribbon.cpp *.hpp rocksdb/*.h tlx Makefile
+debug:	sorter.o ribbon.cpp *.hpp rocksdb/*.h libtlx Makefile
 	$(CXX) $(DBGFLAGS) $(BITS) $(CFLAGS) -o debug$(RIBBON_BITS) ribbon.cpp $(LDFLAGS)
 
-tests:	tests.cpp *.hpp rocksdb/*.h tlx Makefile
+tests:	tests.cpp *.hpp rocksdb/*.h libtlx Makefile
 	$(CXX) -O2 $(CFLAGS) -o tests tests.cpp -lgtest $(LDFLAGS)
 
-parbench: sorter.o parbench.cpp *.hpp rocksdb/*.h tlx Makefile
+parbench: sorter.o parbench.cpp *.hpp rocksdb/*.h libtlx Makefile
 	$(CXX) $(OPTFLAGS) $(BITS) $(CFLAGS) -o parbench$(RIBBON_BITS) parbench.cpp $(LDFLAGS)
 
-parrun: sorter.o parbench.cpp *.hpp rocksdb/*.h tlx Makefile
+parrun: sorter.o parbench.cpp *.hpp rocksdb/*.h libtlx Makefile
 	$(CXX) $(DEFFLAGS) $(BITS) $(CFLAGS) -o parrun$(RIBBON_BITS) parbench.cpp $(LDFLAGS)
 
-pardbg: sorter.o parbench.cpp *.hpp rocksdb/*.h tlx Makefile
+pardbg: sorter.o parbench.cpp *.hpp rocksdb/*.h libtlx Makefile
 	$(CXX) $(DBGFLAGS) $(BITS) $(CFLAGS) -o pardbg$(RIBBON_BITS) parbench.cpp $(LDFLAGS)
 
-tlx:
+libtlx:
 	mkdir -p tlx/build; \
 	cd tlx/build; \
 	cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS=-g0 -GNinja ..; \
