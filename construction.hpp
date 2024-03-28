@@ -403,8 +403,7 @@ bool AddRangeInternal(
 }
 
 template <bool parallel, typename BandingStorage, typename Hasher, typename Iterator,
-          typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>,
-          typename BorderMutexes, typename HashMutex>
+          typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
 bool AddRangeInternalMHC(
     BandingStorage *bs, Hasher &hasher,
     typename BandingStorage::Index start_bucket,
