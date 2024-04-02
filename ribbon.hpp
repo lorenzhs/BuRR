@@ -137,83 +137,6 @@ public:
         }
     }
 
-    template <typename Iterator>
-    bool AddRange(
-        Iterator begin, Iterator end,
-        std::vector<std::conditional_t<
-            kUseMHC, std::conditional_t<kIsFilter, mhc_or_key_t, std::pair<mhc_or_key_t, ResultRow>>,
-            typename std::iterator_traits<Iterator>::value_type>> *bump_vec, std::size_t num_threads = 0) {
-        const auto input_size = end - begin;
-        LOGC(Config::log) << "Constructing for " << storage_.GetNumSlots()
-                          << " slots, " << storage_.GetNumStarts() << " starts, "
-                          << storage_.GetNumBuckets() << " buckets";
-
-        rocksdb::StopWatchNano timer(true);
-        bool success;
-        if constexpr (kUseMHC) {
-            if (num_threads <= 1)
-                success = BandingAddRangeMHC(&storage_, hasher_, begin, end, bump_vec);
-            else
-                success = BandingAddRangeParallelMHC(&storage_, hasher_, begin, end, bump_vec, num_threads);
-        } else {
-            if (num_threads <= 1)
-                success = BandingAddRange(&storage_, hasher_, begin, end, bump_vec);
-            else
-                success = BandingAddRangeParallel(&storage_, hasher_, begin, end, bump_vec, num_threads);
-        }
-        LOGC(Config::log) << "Insertion of " << input_size << " items took "
-                          << timer.ElapsedNanos(true) / 1e6 << "ms";
-
-        if (bump_vec == nullptr)
-            num_bumped = success ? 0 : input_size;
-        else
-            num_bumped = bump_vec->size();
-        empty_slots = static_cast<ssize_t>(storage_.GetNumSlots()) -
-                      input_size + num_bumped;
-        sLOGC(Config::log) << "Bumped" << num_bumped << "out of" << input_size
-                           << "=" << (num_bumped * 100.0 / input_size)
-                           << "% with" << slots_per_item_ << "slots per item =>"
-                           << empty_slots << "empty slots ="
-                           << empty_slots * 100.0 / storage_.GetNumSlots() << "%";
-        return success;
-    }
-
-    void BackSubst(std::size_t num_threads = 0) {
-        if (storage_.GetNumSlots() == 0)
-            return;
-        rocksdb::StopWatchNano timer(true);
-        if constexpr (kUseInterleavedSol) {
-            if (num_threads <= 1)
-                InterleavedBackSubst(storage_, &sol_);
-            else
-                InterleavedBackSubstParallel(storage_, &sol_, num_threads);
-            // move metadata by swapping pointers
-            sol_.MoveMetadata(&storage_);
-            storage_.Reset();
-        } else if constexpr (kUseCacheLineStorage) {
-            sol_.Prepare(storage_.GetNumSlots());
-            if (num_threads <= 1)
-                SimpleBackSubst(storage_, &sol_);
-            else
-                SimpleBackSubstParallel(storage_, &sol_, num_threads);
-            /* FIXME: parallize setting the metadata */
-            // copy metadata one-by-one
-            for (Index bucket = 0; bucket < storage_.GetNumBuckets(); ++bucket) {
-                sol_.SetMeta(bucket, storage_.GetMeta(bucket));
-            }
-            storage_.Reset();
-        } else {
-            if (num_threads <= 1)
-                SimpleBackSubst(storage_, &storage_);
-            else
-                SimpleBackSubstParallel(storage_, &storage_, num_threads);
-        }
-
-        LOGC(Config::log) << "Backsubstitution for " << storage_.GetNumSlots()
-                          << " slots took " << timer.ElapsedNanos(true) / 1e6
-                          << "ms";
-    }
-
     inline std::pair<bool, ResultRow> QueryRetrieval(const Key &key) const {
         if constexpr (kIsFilter || kUseMHC) {
             assert(false);
@@ -289,6 +212,111 @@ public:
     */
 
 protected:
+    /* NOTE: The internal functions also call the sequential version if num_threads == 0, just in case.
+       However, these functions should never be called with num_threads == 0 since the public functions
+       already handle that case. */
+    template <typename Iterator>
+    bool AddRangeInternal(
+        Iterator begin, Iterator end,
+        std::vector<std::conditional_t<
+            kUseMHC, std::conditional_t<kIsFilter, mhc_or_key_t, std::pair<mhc_or_key_t, ResultRow>>,
+            typename std::iterator_traits<Iterator>::value_type>> *bump_vec, std::size_t num_threads = 1) {
+        const auto input_size = end - begin;
+        LOGC(Config::log) << "Constructing for " << storage_.GetNumSlots()
+                          << " slots, " << storage_.GetNumStarts() << " starts, "
+                          << storage_.GetNumBuckets() << " buckets";
+
+        rocksdb::StopWatchNano timer(true);
+        bool success;
+        if constexpr (kUseMHC) {
+            if (num_threads <= 1)
+                success = BandingAddRangeMHC(&storage_, hasher_, begin, end, bump_vec);
+            #ifdef _REENTRANT
+            else
+                success = BandingAddRangeParallelMHC(&storage_, hasher_, begin, end, bump_vec, num_threads);
+            #else
+            else
+                abort(); /* should never happen */
+            #endif
+        } else {
+            if (num_threads <= 1)
+                success = BandingAddRange(&storage_, hasher_, begin, end, bump_vec);
+            #ifdef _REENTRANT
+            else
+                success = BandingAddRangeParallel(&storage_, hasher_, begin, end, bump_vec, num_threads);
+            #else
+            else
+                abort(); /* should never happen */
+            #endif
+        }
+        LOGC(Config::log) << "Insertion of " << input_size << " items took "
+                          << timer.ElapsedNanos(true) / 1e6 << "ms";
+
+        if (bump_vec == nullptr)
+            num_bumped = success ? 0 : input_size;
+        else
+            num_bumped = bump_vec->size();
+        empty_slots = static_cast<ssize_t>(storage_.GetNumSlots()) -
+                      input_size + num_bumped;
+        sLOGC(Config::log) << "Bumped" << num_bumped << "out of" << input_size
+                           << "=" << (num_bumped * 100.0 / input_size)
+                           << "% with" << slots_per_item_ << "slots per item =>"
+                           << empty_slots << "empty slots ="
+                           << empty_slots * 100.0 / storage_.GetNumSlots() << "%";
+        return success;
+    }
+
+    void BackSubstInternal(std::size_t num_threads = 1) {
+        if (storage_.GetNumSlots() == 0)
+            return;
+        rocksdb::StopWatchNano timer(true);
+        if constexpr (kUseInterleavedSol) {
+            if (num_threads <= 1)
+                InterleavedBackSubst(storage_, &sol_);
+            #ifdef _REENTRANT
+            else
+                InterleavedBackSubstParallel(storage_, &sol_, num_threads);
+            #else
+            else
+                abort(); /* should never happen */
+            #endif
+            // move metadata by swapping pointers
+            sol_.MoveMetadata(&storage_);
+            storage_.Reset();
+        } else if constexpr (kUseCacheLineStorage) {
+            sol_.Prepare(storage_.GetNumSlots());
+            if (num_threads <= 1)
+                SimpleBackSubst(storage_, &sol_);
+            #ifdef _REENTRANT
+            else
+                SimpleBackSubstParallel(storage_, &sol_, num_threads);
+            #else
+            else
+                abort(); /* should never happen */
+            #endif
+            /* FIXME: parallize setting the metadata */
+            // copy metadata one-by-one
+            for (Index bucket = 0; bucket < storage_.GetNumBuckets(); ++bucket) {
+                sol_.SetMeta(bucket, storage_.GetMeta(bucket));
+            }
+            storage_.Reset();
+        } else {
+            if (num_threads <= 1)
+                SimpleBackSubst(storage_, &storage_);
+            #ifdef _REENTRANT
+            else
+                SimpleBackSubstParallel(storage_, &storage_, num_threads);
+            #else
+            else
+                abort(); /* should never happen */
+            #endif
+        }
+
+        LOGC(Config::log) << "Backsubstitution for " << storage_.GetNumSlots()
+                          << " slots took " << timer.ElapsedNanos(true) / 1e6
+                          << "ms";
+    }
+
     void Prepare(size_t num_slots) {
         if (num_slots == 0)
             return;
@@ -305,7 +333,7 @@ protected:
     std::enable_if_t<C::kUseMHC,
                      std::unique_ptr<std::conditional_t<
                          kIsFilter, mhc_or_key_t, std::pair<mhc_or_key_t, ResultRow>>[]>>
-    PrepareAddRangeMHC(Iterator begin, Iterator end, std::size_t num_threads = 0) {
+    PrepareAddRangeMHC(Iterator begin, Iterator end, std::size_t num_threads = 1) {
         // this is the top-level filter, transform from vector<Key> to vector<mhc_t>
         rocksdb::StopWatchNano timer(true);
         const auto input_size = end - begin;
@@ -320,6 +348,7 @@ protected:
                 else
                     input[i] = std::make_pair(hasher_.GetMHC(it->first), it->second);
             }
+        #ifdef _REENTRANT
         } else {
             std::size_t items_per_thread = (input_size + num_threads - 1) / num_threads;
             std::vector<std::thread> threads;
@@ -341,6 +370,11 @@ protected:
                 thread.join();
             }
         }
+        #else
+        } else {
+            abort(); /* should never happen */
+        }
+        #endif
         LOGC(Config::log) << "MHC input transformation took "
                           << timer.ElapsedNanos() / 1e6 << "ms";
         return input;
@@ -424,38 +458,28 @@ public:
         child_ribbon_.Init(0, slots_per_item, seed, idx + 1);
     }
 
-    template <typename Iterator, typename C = Config>
-    std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
-        const auto input_size = end - begin;
-        std::vector<std::conditional_t<kIsFilter, Key, std::pair<Key, ResultRow>>> bumped_items;
-        bumped_items.reserve(std::max(
-            0l, static_cast<ssize_t>((1 - slots_per_item_) * input_size)));
-
-        if (!Super::AddRange(begin, end, &bumped_items, num_threads))
-            return false;
-
-        if (bumped_items.size() == 0)
-            return true;
-        // child ribbon will round this up as needed
-        const size_t child_slots =
-            std::max(size_t{1},
-                     static_cast<size_t>(slots_per_item_ * bumped_items.size()));
-        child_ribbon_.Prepare(child_slots);
-        return child_ribbon_.AddRange(bumped_items.data(),
-                                      bumped_items.data() + bumped_items.size(), num_threads);
+    template <typename Iterator>
+    bool AddRange(Iterator begin, Iterator end) {
+        return AddRangeInternal(begin, end);
     }
 
-    // MHC version
-    template <typename Iterator, typename C = Config>
-    std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
-        auto input = Super::PrepareAddRangeMHC(begin, end, num_threads);
-        return AddRangeMHCInternal(input.get(), input.get() + (end - begin), num_threads);
+    void BackSubst() {
+        BackSubstInternal();
     }
 
-    void BackSubst(std::size_t num_threads = 0) {
-        Super::BackSubst(num_threads);
-        child_ribbon_.BackSubst(num_threads);
+    #ifdef _REENTRANT
+    template <typename Iterator>
+    bool AddRange(Iterator begin, Iterator end, std::size_t num_threads) {
+        if (num_threads == 0)
+            num_threads = std::thread::hardware_concurrency();
+        return AddRangeInternal(begin, end, num_threads);
     }
+    void BackSubst(std::size_t num_threads) {
+        if (num_threads == 0)
+            num_threads = std::thread::hardware_concurrency();
+        BackSubstInternal(num_threads);
+    }
+    #endif
 
     inline bool QueryFilter(const Key &key) const {
         if constexpr (kUseMHC) {
@@ -517,10 +541,43 @@ public:
     */
 
 protected:
+    template <typename Iterator, typename C = Config>
+    std::enable_if_t<!C::kUseMHC, bool> AddRangeInternal(Iterator begin, Iterator end, std::size_t num_threads = 1) {
+        const auto input_size = end - begin;
+        std::vector<std::conditional_t<kIsFilter, Key, std::pair<Key, ResultRow>>> bumped_items;
+        bumped_items.reserve(std::max(
+            0l, static_cast<ssize_t>((1 - slots_per_item_) * input_size)));
+
+        if (!Super::AddRangeInternal(begin, end, &bumped_items, num_threads))
+            return false;
+
+        if (bumped_items.size() == 0)
+            return true;
+        // child ribbon will round this up as needed
+        const size_t child_slots =
+            std::max(size_t{1},
+                     static_cast<size_t>(slots_per_item_ * bumped_items.size()));
+        child_ribbon_.Prepare(child_slots);
+        return child_ribbon_.AddRangeInternal(bumped_items.data(),
+                                      bumped_items.data() + bumped_items.size(), num_threads);
+    }
+
+    // MHC version
+    template <typename Iterator, typename C = Config>
+    std::enable_if_t<C::kUseMHC, bool> AddRangeInternal(Iterator begin, Iterator end, std::size_t num_threads = 1) {
+        auto input = Super::PrepareAddRangeMHC(begin, end, num_threads);
+        return AddRangeMHCInternal(input.get(), input.get() + (end - begin), num_threads);
+    }
+
+    void BackSubstInternal(std::size_t num_threads = 1) {
+        Super::BackSubstInternal(num_threads);
+        child_ribbon_.BackSubstInternal(num_threads);
+    }
+
     template <typename C = Config, typename Iterator>
     std::enable_if_t<C::kUseMHC, bool> AddRangeMHCInternal(Iterator begin,
                                                            Iterator end,
-                                                           std::size_t num_threads = 0) {
+                                                           std::size_t num_threads = 1) {
         const auto input_size = end - begin;
         using value_type =
             std::conditional_t<kIsFilter, mhc_or_key_t, std::pair<mhc_or_key_t, ResultRow>>;
@@ -528,7 +585,7 @@ protected:
         bumped_items.reserve(std::max(
             0l, static_cast<ssize_t>((1 - slots_per_item_) * input_size)));
 
-        if (!Super::AddRange(begin, end, &bumped_items, num_threads))
+        if (!Super::AddRangeInternal(begin, end, &bumped_items, num_threads))
             return false;
 
         if (bumped_items.size() == 0)
@@ -597,18 +654,28 @@ public:
         Super::Init(orig_num_slots_, base_slots_per_item_, seed, idx);
     }
 
-    template <typename Iterator, typename C = Config>
-    std::enable_if_t<!C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
-        // there's really no distinction in the base case
-        return AddRangeMHCInternal(begin, end, num_threads);
+    template <typename Iterator>
+    bool AddRange(Iterator begin, Iterator end) {
+        return AddRangeInternal(begin, end);
     }
 
-    // MHC version
-    template <typename Iterator, typename C = Config>
-    std::enable_if_t<C::kUseMHC, bool> AddRange(Iterator begin, Iterator end, std::size_t num_threads = 0) {
-        auto input = Super::PrepareAddRangeMHC(begin, end);
-        return AddRangeMHCInternal(input.get(), input.get() + (end - begin), num_threads);
+    void BackSubst() {
+        BackSubstInternal();
     }
+
+    #ifdef _REENTRANT
+    template <typename Iterator>
+    bool AddRange(Iterator begin, Iterator end, std::size_t num_threads) {
+        if (num_threads == 0)
+            num_threads = std::thread::hardware_concurrency();
+        return AddRangeInternal(begin, end, num_threads);
+    }
+    void BackSubst(std::size_t num_threads) {
+        if (num_threads == 0)
+            num_threads = std::thread::hardware_concurrency();
+        BackSubstInternal(num_threads);
+    }
+    #endif
 
     inline bool QueryFilter(const Key &key) const {
         if constexpr (kUseMHC) {
@@ -616,8 +683,9 @@ public:
             return QueryFilterMHC(mhc);
         } else {
             auto [was_bumped, found] = Super::QueryFilter(key);
+            // FIXME: is there any sensible assert that could still work?
             // This assert can fail in certain circumstances with
-            // negative queries. There can be buckets that inserted
+            // negative queries. There can be buckets that no inserted
             // item is mapped to, in which case the bucket is marked
             // as "all bumped", meaning that any negative queries
             // mapped to this bucket will return was_bumped.
@@ -632,13 +700,15 @@ public:
     inline std::enable_if_t<C::kUseMHC, bool>
     QueryFilterMHC(const typename Super::mhc_or_key_t mhc) const {
         auto [was_bumped, found] = Super::QueryFilterMHC(mhc);
-        assert(!was_bumped);
+        // see comment in QueryFilter
+        //assert(!was_bumped);
         return found;
     }
 
     ResultRow QueryRetrieval(const Key &key) const {
         auto [was_bumped, result] = Super::QueryRetrieval(key);
-        assert(!was_bumped);
+        // see comment in QueryFilter
+        //assert(!was_bumped);
         return result;
     }
 
@@ -646,19 +716,32 @@ public:
     inline std::enable_if_t<C::kUseMHC, ResultRow>
     QueryRetrievalMHC(const typename Super::mhc_or_key_t mhc) const {
         auto [was_bumped, result] = Super::QueryRetrievalMHC(mhc);
-        assert(!was_bumped);
+        // see comment in QueryFilter
+        //assert(!was_bumped);
         return result;
     }
 
-    void BackSubst(std::size_t num_threads = 0) {
+protected:
+    template <typename Iterator, typename C = Config>
+    std::enable_if_t<!C::kUseMHC, bool> AddRangeInternal(Iterator begin, Iterator end, std::size_t num_threads = 1) {
+        // there's really no distinction in the base case
+        return AddRangeMHCInternal(begin, end, num_threads);
+    }
+
+    // MHC version
+    template <typename Iterator, typename C = Config>
+    std::enable_if_t<C::kUseMHC, bool> AddRangeInternal(Iterator begin, Iterator end, std::size_t num_threads = 1) {
+        auto input = Super::PrepareAddRangeMHC(begin, end);
+        return AddRangeMHCInternal(input.get(), input.get() + (end - begin), num_threads);
+    }
+
+    void BackSubstInternal(std::size_t num_threads = 1) {
         (void)num_threads;
         /* the base case ribbon doesn't use any bumping, so the
            sequential version of back substitution must be used */
-        Super::BackSubst(0);
+        Super::BackSubstInternal(1);
     }
 
-
-protected:
     void Prepare(size_t num_slots) {
         orig_num_slots_ = num_slots / parent_slots_per_item_ * base_slots_per_item_;
         Super::Prepare(orig_num_slots_);
@@ -666,10 +749,10 @@ protected:
 
     // misnomer but needed for recursive construction
     template <typename Iterator>
-    bool AddRangeMHCInternal(Iterator begin, Iterator end, std::size_t num_threads = 0) {
+    bool AddRangeMHCInternal(Iterator begin, Iterator end, std::size_t num_threads = 1) {
         bool success;
         do {
-            success = Super::AddRange(begin, end, nullptr, num_threads);
+            success = Super::AddRangeInternal(begin, end, nullptr, num_threads);
             if (!success) {
                 // increase epsilon and try again
                 base_slots_per_item_ += 0.05;

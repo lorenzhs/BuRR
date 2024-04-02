@@ -20,9 +20,12 @@
 #include <ios>
 #endif
 
+#include <iostream>
+
+#ifdef _REENTRANT
 #include <mutex>
 #include <thread>
-#include <iostream>
+#endif
 
 namespace ribbon {
 
@@ -84,6 +87,7 @@ void SimpleBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
 #endif
 }
 
+#ifdef _REENTRANT
 /* NOTE: It is crucial that this is not called by the base case ribbon
    since that does not support bumping */
 template <typename BandingStorage, typename SolutionStorage>
@@ -239,6 +243,7 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
     }
 #endif
 }
+#endif
 
 // A helper for InterleavedBackSubst.
 template <typename BandingStorage>
@@ -339,6 +344,7 @@ void InterleavedBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
 #endif
 }
 
+#ifdef _REENTRANT
 template <typename BandingStorage, typename SolutionStorage>
 void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std::size_t num_threads) {
     using CoeffRow = typename BandingStorage::CoeffRow;
@@ -486,5 +492,6 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
     }
 #endif
 }
+#endif
 
 } // namespace ribbon

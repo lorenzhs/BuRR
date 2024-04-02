@@ -41,8 +41,13 @@ void ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::do_sort(
     // prioritise speed over compile time
     if (num_threads <= 1)
         ips2ra::sort(begin, end, KeyEx);
+    #ifdef _REENTRANT
     else
         ips2ra::parallel::sort(begin, end, KeyEx, num_threads);
+    #else
+    else
+        abort(); /* should never happen */
+    #endif
 #endif
 }
 

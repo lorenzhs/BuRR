@@ -27,8 +27,11 @@
 #include <functional>
 #include <tuple>
 #include <vector>
+
+#ifdef _REENTRANT
 #include <mutex>
 #include <thread>
+#endif
 
 namespace ribbon {
 
@@ -96,8 +99,13 @@ __attribute__((noinline)) void my_sort(Iterator begin, Iterator end, std::size_t
 #else
     if (num_threads <= 1)
         ips2ra::sort(begin, end, [](const auto &x) { return std::get<0>(x); });
+    #ifdef _REENTRANT
     else
         ips2ra::parallel::sort(begin, end, [](const auto &x) { return std::get<0>(x); }, num_threads);
+    #else
+    else
+        abort(); /* should never happen */
+    #endif
 #endif
 }
 
@@ -687,6 +695,7 @@ bool BandingAddRange(BandingStorage *bs, Hasher &hasher, Iterator begin,
         }, [](auto begin, auto end){my_sort(begin, end);});
 }
 
+#ifdef _REENTRANT
 template <typename BandingStorage, typename Hasher, typename Iterator, typename Input,
           typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
 inline void AddRangeParallelInternal(
@@ -938,7 +947,9 @@ inline void AddRangeParallelInternal(
         hasher.Finalise(num_buckets);
     }
 }
+#endif
 
+#ifdef _REENTRANT
 template <typename BandingStorage, typename Hasher, typename Iterator,
           typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
 bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
@@ -1038,6 +1049,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
               << "ms";
     return true;
 }
+#endif
 
 template <typename BandingStorage, typename Hasher, typename Iterator,
           typename BumpStorage = std::vector<typename Hasher::mhc_t>, typename F>
@@ -1101,6 +1113,7 @@ bool BandingAddRangeMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
     );
 }
 
+#ifdef _REENTRANT
 template <typename BandingStorage, typename Hasher, typename Iterator,
           typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
 bool BandingAddRangeParallelMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
@@ -1174,5 +1187,6 @@ bool BandingAddRangeParallelMHC(BandingStorage *bs, Hasher &hasher, Iterator beg
               << "ms";
     return true;
 }
+#endif
 
 } // namespace ribbon
