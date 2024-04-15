@@ -183,6 +183,7 @@ public:
     }
 
     inline Index GetThreadBorderBucket(std::size_t t) const {
+        /* this is only called by the back substitution */
         if (t >= num_thread_borders_) {
             std::cerr << "Wrong number of threads given to back substitution.\n";
             abort();

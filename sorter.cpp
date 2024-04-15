@@ -45,8 +45,10 @@ void ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::do_sort(
     else
         ips2ra::parallel::sort(begin, end, KeyEx, num_threads);
     #else
-    else
+    else {
+        std::cerr << "Parallel version called but not compiled in. This should be impossible.\n";
         abort(); /* should never happen */
+    }
     #endif
 #endif
 }

@@ -103,8 +103,10 @@ __attribute__((noinline)) void my_sort(Iterator begin, Iterator end, std::size_t
     else
         ips2ra::parallel::sort(begin, end, [](const auto &x) { return std::get<0>(x); }, num_threads);
     #else
-    else
+    else {
+        std::cerr << "Parallel version called but not compiled in. This should be impossible.\n";
         abort(); /* should never happen */
+    }
     #endif
 #endif
 }

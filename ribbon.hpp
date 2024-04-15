@@ -235,8 +235,10 @@ protected:
             else
                 success = BandingAddRangeParallelMHC(&storage_, hasher_, begin, end, bump_vec, num_threads);
             #else
-            else
+            else {
+                std::cerr << "Parallel version called but not compiled in. This should be impossible.\n";
                 abort(); /* should never happen */
+            }
             #endif
         } else {
             if (num_threads <= 1)
@@ -245,8 +247,10 @@ protected:
             else
                 success = BandingAddRangeParallel(&storage_, hasher_, begin, end, bump_vec, num_threads);
             #else
-            else
+            else {
+                std::cerr << "Parallel version called but not compiled in. This should be impossible.\n";
                 abort(); /* should never happen */
+            }
             #endif
         }
         LOGC(Config::log) << "Insertion of " << input_size << " items took "
@@ -277,8 +281,10 @@ protected:
             else
                 InterleavedBackSubstParallel(storage_, &sol_, num_threads);
             #else
-            else
+            else {
+                std::cerr << "Parallel version called but not compiled in. This should be impossible.\n";
                 abort(); /* should never happen */
+            }
             #endif
             // move metadata by swapping pointers
             sol_.MoveMetadata(&storage_);
@@ -291,8 +297,10 @@ protected:
             else
                 SimpleBackSubstParallel(storage_, &sol_, num_threads);
             #else
-            else
+            else {
+                std::cerr << "Parallel version called but not compiled in. This should be impossible.\n";
                 abort(); /* should never happen */
+            }
             #endif
             /* FIXME: parallize setting the metadata */
             // copy metadata one-by-one
@@ -307,8 +315,10 @@ protected:
             else
                 SimpleBackSubstParallel(storage_, &storage_, num_threads);
             #else
-            else
+            else {
+                std::cerr << "Parallel version called but not compiled in. This should be impossible.\n";
                 abort(); /* should never happen */
+            }
             #endif
         }
 
@@ -372,6 +382,7 @@ protected:
         }
         #else
         } else {
+            std::cerr << "Parallel version called but not compiled in. This should be impossible.\n";
             abort(); /* should never happen */
         }
         #endif
