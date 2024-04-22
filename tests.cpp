@@ -144,15 +144,27 @@ void BasicRibbonTest(size_t input_size) {
     ribbon::ribbon_filter<depth, Config> r(input_size, 0.95, 42);
     r.AddRange(input.begin(), input.end());
     r.BackSubst();
+#if _REENTRANT
+    ribbon::ribbon_filter<depth, Config> rp(input_size, 0.95, 42);
+    rp.AddRange(input.begin(), input.end(), std::thread::hardware_concurrency());
+    rp.BackSubst(std::thread::hardware_concurrency());
+#endif
 
     for (const auto& v : input) {
         ASSERT_TRUE(r.QueryFilter(v));
+#if _REENTRANT
+        ASSERT_TRUE(rp.QueryFilter(v));
+#endif
     }
     // negative queries
     size_t fp_count = 0;
+    size_t fp_countp = 0;
     const int num_queries = 3 * input_size;
     for (int v = input_size; v < (int)input_size + num_queries; v++) {
         fp_count += r.QueryFilter(v);
+#if _REENTRANT
+        fp_countp += rp.QueryFilter(v);
+#endif
     }
     double expected_fp_count = num_queries * 1.0 / (1ul << result_bits);
     // For expected FP rate, also include false positives due to collisions
@@ -163,6 +175,9 @@ void BasicRibbonTest(size_t input_size) {
 
     // Allow 3 standard deviations
     EXPECT_LE(fp_count, PoissonUpperBound(expected_fp_count + correction, 3.0));
+#if _REENTRANT
+    EXPECT_LE(fp_countp, PoissonUpperBound(expected_fp_count + correction, 3.0));
+#endif
 }
 
 
@@ -202,6 +217,15 @@ void BasicRibbonRetrievalTest(size_t input_size) {
     for (const auto& [key, val] : input) {
         ASSERT_EQ(val, r.QueryRetrieval(key));
     }
+#if _REENTRANT
+    ribbon::ribbon_filter<depth, Config> rp(input_size, 0.95, 42);
+    rp.AddRange(input.begin(), input.end(), std::thread::hardware_concurrency());
+    rp.BackSubst(std::thread::hardware_concurrency());
+
+    for (const auto& [key, val] : input) {
+        ASSERT_EQ(val, rp.QueryRetrieval(key));
+    }
+#endif
 }
 
 
