@@ -1020,7 +1020,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     const Index buckets_per_thread = num_buckets / num_threads;
     if (buckets_per_thread < kMinBucketsPerThread) {
         num_threads = num_buckets / kMinBucketsPerThread;
-        LOGC(log) << "reducing to " << num_threads << " threads.";
+        LOGC(log) << "Reducing to " << num_threads << " threads.";
         if (num_threads <= 1)
             return BandingAddRangeBase(bs, hasher, begin, end, bump_vec, process_input, sort_parallel);
     }
@@ -1165,7 +1165,7 @@ bool BandingAddRangeParallelMHC(BandingStorage *bs, Hasher &hasher, Iterator beg
     const Index buckets_per_thread = num_buckets / num_threads;
     if (buckets_per_thread < kMinBucketsPerThread) {
         num_threads = num_buckets / kMinBucketsPerThread;
-        LOGC(log) << "reducing to " << num_threads << " threads.";
+        LOGC(log) << "Reducing to " << num_threads << " threads.";
         if (num_threads <= 1)
             return BandingAddRangeBaseMHC(bs, hasher, begin, end, bump_vec, sort_parallel);
     }

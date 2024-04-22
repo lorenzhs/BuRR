@@ -168,7 +168,9 @@ public:
     // The minimum number of buckets that should be processed per thread when
     // inserting elements in parallel. If there are too few buckets, the number
     // of threads is reduced.
-    static constexpr Index kMinBucketsPerThread = 200000 / kBucketSize;
+    // Increasing this will possibly save a few bytes because there are fewer
+    // thread boundaries, but may also increase the runtime.
+    static constexpr Index kMinBucketsPerThread = 20000 / kBucketSize;
 
     // How many bits the retrieval data structure should store per key / how
     // many fingerprint bits to use in a filter.  When using interleaved
@@ -289,7 +291,7 @@ struct RConfig
         bucket_sh < 0 ? (recommended_bucket_size<coeff_bits, mode> >> -bucket_sh)
                       : (recommended_bucket_size<coeff_bits, mode> << bucket_sh);
     static constexpr Index kMinBucketsPerThread =
-        min_buckets_per_thread < 0 ? 200000 / kBucketSize : min_buckets_per_thread;
+        min_buckets_per_thread < 0 ? 20000 / kBucketSize : min_buckets_per_thread;
     static constexpr bool kSparseCoeffs = sparse,
                           kUseInterleavedSol = interleaved,
                           kUseCacheLineStorage = cls, kUseMHC = true;
