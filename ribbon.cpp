@@ -47,14 +47,16 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads) {
 
     LOG1 << "Allocation took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
 
-    LOG1 << "Adding rows to filter (parallel, " << num_threads << " threads)....";
+    LOG1 << "Adding rows to filter (" << num_threads << " threads)....";
     r.AddRange(input.get(), input.get() + num_items, num_threads);
-    LOG1 << "Insertion took " << timer.ElapsedNanos(true) / 1e6 << "ms in total\n";
+    uint64_t insertionTime = timer.ElapsedNanos(true);
+    LOG1 << "Insertion took " << insertionTime / 1e6 << "ms in total\n";
 
     input.reset();
 
     r.BackSubst(num_threads);
-    LOG1 << "Backsubstitution (par) took " << timer.ElapsedNanos(true) / 1e6
+    uint64_t backsubstTime = timer.ElapsedNanos(true);
+    LOG1 << "Backsubstitution took " << backsubstTime / 1e6
          << "ms in total\n";
 
     const size_t bytes = r.Size();
@@ -124,6 +126,7 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads) {
     auto [tl_bumped, tl_empty_slots, tl_frac_empty, tl_thresh_bytes] =
         r.GetStats();
     LOG1 << "RESULT n=" << num_items << " m=" << num_slots << " eps=" << eps
+         << " backsubstns=" << backsubstTime << " insertionns=" << insertionTime
          << " d=" << (int)depth << dump_config<Config>() << " bytes=" << bytes
          << " tlempty=" << tl_empty_slots << " tlbumped=" << tl_bumped
          << " tlemptyfrac=" << tl_frac_empty
