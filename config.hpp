@@ -131,19 +131,23 @@ std::string dump_config() {
       << " keybits=" << 8u * sizeof(Key) << " filter=" << kIsFilter
       << " minbpt=" << kMinBucketsPerThread << " srange=" << kBucketSearchRange
       << " smode=";
-    switch (kBucketSearchMode) {
-    case BucketSearchMode::minbump:
-        s << "minbump";
-        break;
-    case BucketSearchMode::maxprev:
-        s << "maxprev";
-        break;
-    case BucketSearchMode::diff:
-        s << "diff";
-        break;
-    default:
-        s << "unknown";
-        break;
+    if (kBucketSearchRange == 0) {
+        s << "nosearch";
+    } else {
+        switch (kBucketSearchMode) {
+        case BucketSearchMode::minbump:
+            s << "minbump";
+            break;
+        case BucketSearchMode::maxprev:
+            s << "maxprev";
+            break;
+        case BucketSearchMode::diff:
+            s << "diff";
+            break;
+        default:
+            s << "unknown";
+            break;
+        }
     }
     return s.str();
 }
