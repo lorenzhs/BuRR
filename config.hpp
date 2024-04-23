@@ -129,7 +129,22 @@ std::string dump_config() {
       << (kUseInterleavedSol ? "int" : (kUseCacheLineStorage ? "cls" : "basic"))
       << " fcao=" << kFirstCoeffAlwaysOne << " idxbits=" << 8u * sizeof(Index)
       << " keybits=" << 8u * sizeof(Key) << " filter=" << kIsFilter
-      << " minbpt=" << kMinBucketsPerThread;
+      << " minbpt=" << kMinBucketsPerThread << " srange=" << kBucketSearchRange
+      << " smode=";
+    switch (kBucketSearchMode) {
+    case BucketSearchMode::minbump:
+        s << "minbump";
+        break;
+    case BucketSearchMode::maxprev:
+        s << "maxprev";
+        break;
+    case BucketSearchMode::diff:
+        s << "diff";
+        break;
+    default:
+        s << "unknown";
+        break;
+    }
     return s.str();
 }
 
@@ -220,7 +235,7 @@ public:
     // level's hash if the key was bumped.  This is almost always a good idea.
     static constexpr bool kUseMHC = false;
     // Whether to print timings and other information about the construction.
-    static constexpr bool log = true;
+    static constexpr bool log = false;
     // Number of buckets to search to find the bucket in which the
     // minimum number of elements needs to be bumped
     // (when using the parallel version)
