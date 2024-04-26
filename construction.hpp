@@ -257,11 +257,11 @@ bool AddRangeInternal(
             // moving to next bucket
             sLOG << "Moving to bucket" << bucket << "was" << last_bucket;
             if constexpr (parallel) {
-                if (thread_index > 0 && last_bucket < safe_start_bucket && bucket >= safe_start_bucket) {
+                if (start_locked && bucket >= safe_start_bucket) {
                     border_mutexes[thread_index - 1].unlock();
                     start_locked = false;
                 }
-                if (thread_index < num_threads - 1 && last_bucket <= safe_end_bucket && bucket > safe_end_bucket) {
+                if (thread_index < num_threads - 1 && !end_locked && bucket > safe_end_bucket) {
                     border_mutexes[thread_index].lock();
                     end_locked = true;
                 }
@@ -494,11 +494,11 @@ bool AddRangeInternalMHC(
             // moving to next bucket
             sLOG << "Moving to bucket" << bucket << "was" << last_bucket;
             if constexpr (parallel) {
-                if (thread_index > 0 && last_bucket < safe_start_bucket && bucket >= safe_start_bucket) {
+                if (start_locked && bucket >= safe_start_bucket) {
                     border_mutexes[thread_index - 1].unlock();
                     start_locked = false;
                 }
-                if (thread_index < num_threads - 1 && last_bucket <= safe_end_bucket && bucket > safe_end_bucket) {
+                if (thread_index < num_threads - 1 && !end_locked && bucket > safe_end_bucket) {
                     border_mutexes[thread_index].lock();
                     end_locked = true;
                 }
@@ -736,14 +736,57 @@ inline void AddRangeParallelInternal(
     std::condition_variable vec_cv;
     std::size_t vec_rem = num_threads;
     std::vector<std::size_t> bump_vec_start_pos(num_threads + 1);
+
+    const auto resize_bump_vec = [&]() {
+        /* I guess this is probably always 0 anyways */
+        bump_vec_start_pos[0] = bump_vec->size();
+        for (std::size_t i = 0; i < num_threads; ++i) {
+            bump_vec_start_pos[i + 1] += bump_vec_start_pos[i];
+        }
+        bump_vec->resize(bump_vec_start_pos[num_threads]);
+    };
+
+    /* If we return from a thread early because the range starts after the
+       last bucket or item, we still need to set some things to avoid
+       issues with other threads.
+
+       FIXME: It might be a better idea to guard the code below against this
+       condition instead of having all this duplicated code that has to
+       be run before returning. */
+    const auto return_safe = [&](std::size_t ti) {
+        if constexpr (kBucketSearchRange > 0) {
+            if (ti > 0) {
+                bs->SetThreadBorderBucket(ti - 1, num_buckets);
+                thread_ends[ti - 1] = num_items;
+            }
+        }
+        if constexpr (kBucketSearchRange > 0) {
+            std::unique_lock l(search_mtx);
+            --search_rem;
+            if (search_rem == 0) {
+                l.unlock();
+                search_cv.notify_all();
+            }
+        }
+        std::unique_lock l(vec_mtx);
+        --vec_rem;
+        if (vec_rem == 0) {
+            resize_bump_vec();
+            l.unlock();
+            vec_cv.notify_all();
+        }
+    };
+
     for (std::size_t ti = 0; ti < num_threads; ++ti) {
         threads.emplace_back([&, ti]() {
             BumpStorage local_bump_vec;
             local_bump_vec.reserve(bump_reserve);
 
             Index start_bucket = ti * buckets_per_thread;
-            if (start_bucket >= num_buckets)
+            if (start_bucket >= num_buckets) {
+                return_safe(ti);
                 return;
+            }
             Index end_bucket = start_bucket + buckets_per_thread - 1;
             if (end_bucket >= num_buckets)
                 end_bucket = num_buckets - 1;
@@ -762,6 +805,7 @@ inline void AddRangeParallelInternal(
                     return v < Hasher::GetBucket(start);
                 });
                 if (start_it == end) {
+                    return_safe(ti);
                     return;
                 }
                 start_index = start_it - begin;
@@ -776,11 +820,19 @@ inline void AddRangeParallelInternal(
                     return v < Hasher::GetBucket(std::get<0>(e));
                 });
                 if (start_it == input.get() + num_items) {
+                    return_safe(ti);
                     return;
                 }
                 start_index = start_it - input.get();
                 end_index = end_it - input.get();
             }
+
+            /* NOTE; It is important that we do not return immediately even if the item range is
+               empty because it's theoretically possible that this is the case but through the
+               bucket search, the end index is moved, causing the range to become non-empty.
+               This case will probably never occur in practice, especially when kMinBucketsPerThread
+               is set to a sensible value, but it doesn't hurt to be careful. Of course, this hasn't
+               been tested properly, so it might blow up anyways when that happens. */
 
             if constexpr (kBucketSearchRange > 0) {
                 if (ti > 0) {
@@ -873,8 +925,8 @@ inline void AddRangeParallelInternal(
                     }
                     /* this should only happen if end_index == start_index or
                        the loop ran all the way to end_index - 1, both of
-                       which are edge cases that should never happen when the
-                       parameters are chosen properly */
+                       which are edge cases that shouldn't usually happen when
+                       the parameters are chosen properly */
                     if (diff < min_elems) {
                         min_bucket = cur_bucket;
                         min_bucket_start = cur_bucket_start;
@@ -886,10 +938,14 @@ inline void AddRangeParallelInternal(
                 {
                     std::unique_lock l(search_mtx);
                     --search_rem;
-                    if (search_rem > 0)
-                        search_cv.wait(l);
-                    else
+                    if (search_rem > 0) {
+                        do {
+                            search_cv.wait(l);
+                        } while (search_rem > 0);
+                    } else {
+                        l.unlock();
                         search_cv.notify_all();
+                    }
                 }
                 if (ti < num_threads - 1) {
                     end_bucket = bs->GetThreadBorderBucket(ti);
@@ -905,6 +961,11 @@ inline void AddRangeParallelInternal(
                 }
             }
 
+            /* NOTE: It is theoretically possible for the range to be empty,
+               although this will probably never happen in practice. In that
+               case, the loop in AddRangeInternal[MHC] will not run, so only
+               the threshold of start_bucket will be set to NoBumpThresh().
+               This will only affect the behavior of negative queries, though. */
             if constexpr (Hasher::kUseMHC) {
                 AddRangeInternalMHC<true>(
                     bs, hasher, start_bucket, end_bucket, start_index, end_index,
@@ -922,14 +983,12 @@ inline void AddRangeParallelInternal(
                 std::unique_lock l(vec_mtx);
                 --vec_rem;
                 if (vec_rem > 0) {
-                    vec_cv.wait(l);
+                    do {
+                        vec_cv.wait(l);
+                    } while (vec_rem > 0);
                 } else {
-                    /* I guess this is probably always 0 anyways */
-                    bump_vec_start_pos[0] = bump_vec->size();
-                    for (std::size_t i = 0; i < num_threads; ++i) {
-                        bump_vec_start_pos[i + 1] += bump_vec_start_pos[i];
-                    }
-                    bump_vec->resize(bump_vec_start_pos[num_threads]);
+                    resize_bump_vec();
+                    l.unlock();
                     vec_cv.notify_all();
                 }
             }
@@ -1014,9 +1073,20 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     const Index num_buckets = bs->GetNumBuckets();
     const Index num_starts = bs->GetNumStarts();
 
-    /* NOTE: Here, we round down in order to make sure that all threads
-       get at least kMinBucketsPerThread buckets. Later, we round up
-       for the actual distribution. */
+    /* NOTE: It can still happen that the last thread doesn't
+       get kMinBucketsPerThread buckets, for instance with
+       num_threads == 5, kMinBucketsPerThread == 3, and
+       num_buckets == 16. This could be fixed either by
+       reducing the number of threads even if there are
+       actually enough buckets for each thread to get enough,
+       or by changing the distribution across the threads.
+       The latter would be annoying to implement because the
+       entire rest of the code has already been implemented
+       in such a way that it assumes all threads except for the
+       last one have the same number of elements. However, it
+       probably doesn't matter because the code is written to
+       deal with the last thread having fewer buckets (possibly
+       even zero, like in the example above). */
     const Index buckets_per_thread = num_buckets / num_threads;
     if (buckets_per_thread < kMinBucketsPerThread) {
         num_threads = num_buckets / kMinBucketsPerThread;
@@ -1159,9 +1229,7 @@ bool BandingAddRangeParallelMHC(BandingStorage *bs, Hasher &hasher, Iterator beg
     const Index num_buckets = bs->GetNumBuckets();
     const Index num_starts = bs->GetNumStarts();
 
-    /* NOTE: Here, we round down in order to make sure that all threads
-       get at least kMinBucketsPerThread buckets. Later, we round up
-       for the actual distribution. */
+    /* NOTE: See comment in BandingAddRangeParallel */
     const Index buckets_per_thread = num_buckets / num_threads;
     if (buckets_per_thread < kMinBucketsPerThread) {
         num_threads = num_buckets / kMinBucketsPerThread;
