@@ -237,7 +237,7 @@ public:
     // Whether to use Master Hash Codes.  This causes keys to be hashed only
     // once during insertion and query, using hash remixing to derive the next
     // level's hash if the key was bumped.  This is almost always a good idea.
-    static constexpr bool kUseMHC = false;
+    static constexpr bool kUseMHC = true;
     // Whether to print timings and other information about the construction.
     static constexpr bool log = false;
     // Number of buckets to search to find the bucket in which the

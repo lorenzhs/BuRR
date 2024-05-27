@@ -129,6 +129,8 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads) {
          << " backsubstns=" << backsubstTime << " insertionns=" << insertionTime
          << " d=" << (int)depth << dump_config<Config>() << " bytes=" << bytes
          << " tlempty=" << tl_empty_slots << " tlbumped=" << tl_bumped
+         << " totalbumped=" << r.GetTotalNumBumped()
+         << " base_empty=" << r.GetBaseCaseEmptySlots()
          << " tlemptyfrac=" << tl_frac_empty
          << " tlthreshbytes=" << tl_thresh_bytes << " overhead=" << relsize - 100
          << " ok=" << ok << " tpos=" << check_nanos

@@ -544,6 +544,15 @@ public:
         return Super::Size() + child_ribbon_.Size();
     }
 
+    /* GetStats only returns information for the top-level ribbon */
+    ssize_t GetTotalNumBumped() const {
+        return Super::num_bumped + child_ribbon_.GetTotalNumBumped();
+    }
+
+    ssize_t GetBaseCaseEmptySlots() const {
+        return child_ribbon_.GetBaseCaseEmptySlots();
+    }
+
     /*
     void PrintStats() const {
         Super::PrintStats();
@@ -730,6 +739,14 @@ public:
         // see comment in QueryFilter
         //assert(!was_bumped);
         return result;
+    }
+
+    ssize_t GetTotalNumBumped() const {
+        return 0;
+    }
+
+    ssize_t GetBaseCaseEmptySlots() const {
+        return Super::empty_slots;
     }
 
 protected:
