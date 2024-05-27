@@ -712,7 +712,6 @@ inline void AddRangeParallelInternal(
 
     const Index num_buckets = bs->GetNumBuckets();
     [[maybe_unused]] const Index num_starts = bs->GetNumStarts();
-    const Index buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
 
     const auto num_items = end - begin;
 
@@ -782,14 +781,16 @@ inline void AddRangeParallelInternal(
             BumpStorage local_bump_vec;
             local_bump_vec.reserve(bump_reserve);
 
-            Index start_bucket = ti * buckets_per_thread;
-            if (start_bucket >= num_buckets) {
-                return_safe(ti);
-                return;
-            }
-            Index end_bucket = start_bucket + buckets_per_thread - 1;
-            if (end_bucket >= num_buckets)
-                end_bucket = num_buckets - 1;
+            /* NOTE: This is assumed to never be 0. That could only happen if
+               kMinBucketsPerThread is also 0, which is prevented by a static_assert */
+            const Index local_num_buckets =
+                num_buckets / num_threads +
+                (ti < num_buckets % num_threads);
+            Index start_bucket =
+                ti * (num_buckets / num_threads) +
+                (ti < num_buckets % num_threads ? ti : num_buckets % num_threads);
+
+            Index end_bucket = start_bucket + local_num_buckets - 1;
             Index start_index = 0, end_index = 0;
             if constexpr (Hasher::kUseMHC) {
                 auto start_it = std::lower_bound(
@@ -1047,13 +1048,17 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     /* this uses the original number of threads before it is possibly reduced */
     const auto process_input = [num_threads](BandingStorage *bs, Hasher &hasher, auto &input, Iterator begin, Iterator end) {
         const auto num_items = end - begin;
-        std::size_t items_per_thread = (num_items + num_threads - 1) / num_threads;
         std::vector<std::thread> threads;
         threads.reserve(num_threads);
         for (std::size_t ti = 0; ti < num_threads; ++ti) {
             threads.emplace_back([&, ti]() {
-                Index start_idx = static_cast<Index>(ti * items_per_thread);
-                Index end_idx = static_cast<Index>(std::min((ti + 1) * items_per_thread, static_cast<std::size_t>(num_items)));
+                const Index local_num_items =
+                    num_items / num_threads +
+                    (ti < num_items % num_threads);
+                Index start_idx =
+                    ti * (num_items / num_threads) +
+                    (ti < num_items % num_threads ? ti : num_items % num_threads);
+                Index end_idx = start_idx + local_num_items;
                 ProcessInput(bs, hasher, input, begin, start_idx, end_idx);
             });
         }
@@ -1073,20 +1078,6 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     const Index num_buckets = bs->GetNumBuckets();
     const Index num_starts = bs->GetNumStarts();
 
-    /* NOTE: It can still happen that the last thread doesn't
-       get kMinBucketsPerThread buckets, for instance with
-       num_threads == 5, kMinBucketsPerThread == 3, and
-       num_buckets == 16. This could be fixed either by
-       reducing the number of threads even if there are
-       actually enough buckets for each thread to get enough,
-       or by changing the distribution across the threads.
-       The latter would be annoying to implement because the
-       entire rest of the code has already been implemented
-       in such a way that it assumes all threads except for the
-       last one have the same number of elements. However, it
-       probably doesn't matter because the code is written to
-       deal with the last thread having fewer buckets (possibly
-       even zero, like in the example above). */
     const Index buckets_per_thread = num_buckets / num_threads;
     if (buckets_per_thread < kMinBucketsPerThread) {
         num_threads = num_buckets / kMinBucketsPerThread;
@@ -1229,7 +1220,6 @@ bool BandingAddRangeParallelMHC(BandingStorage *bs, Hasher &hasher, Iterator beg
     const Index num_buckets = bs->GetNumBuckets();
     const Index num_starts = bs->GetNumStarts();
 
-    /* NOTE: See comment in BandingAddRangeParallel */
     const Index buckets_per_thread = num_buckets / num_threads;
     if (buckets_per_thread < kMinBucketsPerThread) {
         num_threads = num_buckets / kMinBucketsPerThread;

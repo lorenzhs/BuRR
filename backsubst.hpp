@@ -117,7 +117,6 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
             return;
         }
     }
-    buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
 
     // sss->PrepareForNumStarts(num_starts);
     const Index num_slots = num_starts + kCoeffBits - 1;
@@ -134,11 +133,13 @@ void SimpleBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol, std
             std::array<CoeffRow, kResultBits> state;
             state.fill(0);
 
-            Index start_bucket = ti * buckets_per_thread;
-            /* deal with cases where some threads don't get any elements */
-            if (start_bucket >= num_buckets)
-                return;
-            Index end_bucket = start_bucket + buckets_per_thread;
+            const Index local_num_buckets =
+                num_buckets / num_threads +
+                (ti < num_buckets % num_threads);
+            Index start_bucket =
+                ti * (num_buckets / num_threads) +
+                (ti < num_buckets % num_threads ? ti : num_buckets % num_threads);
+            Index end_bucket = start_bucket + local_num_buckets;
             if constexpr (kBucketSearchRange > 0) {
                 if (ti < num_threads - 1) {
                     end_bucket = bs.GetThreadBorderBucket(ti);
@@ -389,7 +390,6 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
             return;
         }
     }
-    buckets_per_thread = (num_buckets + num_threads - 1) / num_threads;
 
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
@@ -403,11 +403,13 @@ void InterleavedBackSubstParallel(const BandingStorage &bs, SolutionStorage *sol
             // (based also on banding data).
             std::unique_ptr<CoeffRow[]> state{new CoeffRow[kResultBits]()};
 
-            Index start_bucket = ti * buckets_per_thread;
-            /* deal with cases where some threads don't get any elements */
-            if (start_bucket >= num_buckets)
-                return;
-            Index end_bucket = start_bucket + buckets_per_thread;
+            const Index local_num_buckets =
+                num_buckets / num_threads +
+                (ti < num_buckets % num_threads);
+            Index start_bucket =
+                ti * (num_buckets / num_threads) +
+                (ti < num_buckets % num_threads ? ti : num_buckets % num_threads);
+            Index end_bucket = start_bucket + local_num_buckets;
             if constexpr (kBucketSearchRange > 0) {
                 if (ti < num_threads - 1) {
                     end_bucket = bs.GetThreadBorderBucket(ti);
