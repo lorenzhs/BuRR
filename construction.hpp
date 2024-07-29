@@ -727,9 +727,9 @@ inline void AddRangeParallelInternal(
         bs->SetNumThreadBorders(num_threads);
     }
     /* used for synchronizing the search for the bucket in which to bump between threads */
-    [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::mutex> search_mtx;
-    [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::condition_variable> search_cv;
-    [[maybe_unused]] std::size_t search_rem = num_threads;
+    [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::vector<std::mutex>> search_mtx(num_threads - 1);
+    [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::vector<std::condition_variable>> search_cv(num_threads - 1);
+    [[maybe_unused]] std::conditional_t<kBucketSearchRange <= 0, int, std::vector<char>> search_status(num_threads - 1);
     /* used for synchronizing the copying of the local bump vectors into the global bump vector */
     std::mutex vec_mtx;
     std::condition_variable vec_cv;
@@ -757,14 +757,10 @@ inline void AddRangeParallelInternal(
             if (ti > 0) {
                 bs->SetThreadBorderBucket(ti - 1, num_buckets);
                 thread_ends[ti - 1] = num_items;
-            }
-        }
-        if constexpr (kBucketSearchRange > 0) {
-            std::unique_lock l(search_mtx);
-            --search_rem;
-            if (search_rem == 0) {
+                std::unique_lock l(search_mtx[ti - 1]);
+                search_status[ti - 1] = 1;
                 l.unlock();
-                search_cv.notify_all();
+                search_cv[ti - 1].notify_all();
             }
         }
         std::unique_lock l(vec_mtx);
@@ -935,17 +931,15 @@ inline void AddRangeParallelInternal(
 
                     bs->SetThreadBorderBucket(ti - 1, min_bucket);
                     thread_ends[ti - 1] = min_bucket_start;
+                    std::unique_lock l(search_mtx[ti - 1]);
+                    search_status[ti - 1] = 1;
+                    l.unlock();
+                    search_cv[ti - 1].notify_all();
                 }
-                {
-                    std::unique_lock l(search_mtx);
-                    --search_rem;
-                    if (search_rem > 0) {
-                        do {
-                            search_cv.wait(l);
-                        } while (search_rem > 0);
-                    } else {
-                        l.unlock();
-                        search_cv.notify_all();
+                if (ti < num_threads - 1) {
+                    std::unique_lock l(search_mtx[ti]);
+                    while (!search_status[ti]) {
+                        search_cv[ti].wait(l);
                     }
                 }
                 if (ti < num_threads - 1) {
