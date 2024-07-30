@@ -27,11 +27,11 @@ using namespace ribbon;
 bool no_queries = false;
 
 template <uint8_t depth, typename Config>
-void run(size_t num_slots, double eps, size_t seed, unsigned num_threads) {
+void run(size_t num_items, double eps, size_t seed, unsigned num_threads) {
     IMPORT_RIBBON_CONFIG(Config);
 
     const double slots_per_item = eps + 1.0;
-    const size_t num_items = num_slots / slots_per_item;
+    const size_t num_slots = num_items * slots_per_item;
     LOG1 << "Running simple test with " << num_slots << " slots, eps=" << eps
          << " -> " << num_items << " items, seed=" << seed
          << " config: L=" << kCoeffBits << " B=" << kBucketSize
@@ -125,18 +125,30 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads) {
     // r.PrintStats();
     auto [tl_bumped, tl_empty_slots, tl_frac_empty, tl_thresh_bytes] =
         r.GetStats();
-    LOG1 << "RESULT n=" << num_items << " m=" << num_slots << " eps=" << eps
+    auto level_stats = r.GetLevelStats();
+    std::cout << "RESULT n=" << num_items << " m=" << num_slots << " eps=" << eps
          << " backsubstns=" << backsubstTime << " insertionns=" << insertionTime
          << " d=" << (int)depth << dump_config<Config>() << " bytes=" << bytes
          << " tlempty=" << tl_empty_slots << " tlbumped=" << tl_bumped
-         << " totalbumped=" << r.GetTotalNumBumped()
-         << " base_empty=" << r.GetBaseCaseEmptySlots()
          << " tlemptyfrac=" << tl_frac_empty
          << " tlthreshbytes=" << tl_thresh_bytes << " overhead=" << relsize - 100
          << " ok=" << ok << " tpos=" << check_nanos
          << " tpospq=" << (check_nanos * 1.0 / num_items) << " tneg=" << negq_nanos
          << " tnegpq=" << (negq_nanos * 1.0 / num_items) << " fps=" << found
          << " fpr=" << fprate << " ratio=" << ratio << " threads=" << num_threads;
+    uint64_t sort_total = 0;
+    ssize_t total_bumped = 0;
+    for (size_t i = 0; i < level_stats.size(); ++i) {
+        std::cout << " numbumped" << i << "=" << level_stats[i].num_bumped;
+        std::cout << " emptyslots" << i << "=" << level_stats[i].empty_slots;
+        std::cout << " numthreads" << i << "=" << level_stats[i].num_threads;
+        std::cout << " sortns" << i << "=" << level_stats[i].sort_time;
+        std::cout << " size" << i << "=" << level_stats[i].size;
+        sort_total += level_stats[i].sort_time;
+        total_bumped += level_stats[i].num_bumped;
+    }
+    std::cout << " totalbumped=" << total_bumped;
+    std::cout << " sortns=" << sort_total << "\n";
 }
 
 
@@ -228,7 +240,7 @@ void dispatch(ThreshMode mode, Args&... args) {
 
 int main(int argc, char** argv) {
     tlx::CmdlineParser cmd;
-    size_t seed = 42, num_slots = 1024 * 1024;
+    size_t seed = 42, num_items = 1024 * 1024;
     unsigned ribbon_width = 32, depth = 3;
     double eps = -1;
     unsigned num_threads = std::thread::hardware_concurrency();
@@ -236,7 +248,10 @@ int main(int argc, char** argv) {
          interleaved = false;
     int shift = 0;
     cmd.add_size_t('s', "seed", seed, "random seed");
-    cmd.add_size_t('m', "slots", num_slots, "number of slots in the filter");
+    // Ideally, both settings would be allowed (but mutually exclusive), but it
+    // doesn't seem to be // possible to check if an option was set with tlx::CmdlineParser
+    //cmd.add_size_t('m', "slots", num_slots, "number of slots in the filter");
+    cmd.add_size_t('n', "items", num_items, "number of items in the filter");
     cmd.add_unsigned('L', "ribbon_width", ribbon_width, "ribbon width (16/32/64)");
     cmd.add_unsigned('d', "depth", depth, "number of recursive filters");
     cmd.add_double('e', "epsilon", eps, "epsilon, #items = filtersize/(1+epsilon)");
@@ -282,5 +297,5 @@ int main(int argc, char** argv) {
                              : (twobit ? ThreshMode::twobit : ThreshMode::normal);
 
     dispatch(mode, depth, ribbon_width, cls, interleaved, sparsecoeffs, shift,
-             num_slots, eps, seed, num_threads);
+             num_items, eps, seed, num_threads);
 }

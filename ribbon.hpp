@@ -33,6 +33,14 @@ struct BaseConfig : Config {
         recommended_bucket_size<8u * sizeof(CoeffRow), Config::kThreshMode>;
 };
 
+struct RibbonLevelStats {
+    ssize_t num_bumped;
+    ssize_t empty_slots;
+    size_t num_threads;
+    uint64_t sort_time;
+    size_t size;
+};
+
 // Ribbon base class
 template <typename Config>
 class ribbon_base {
@@ -211,6 +219,10 @@ public:
     }
     */
 
+    RibbonLevelStats GetSingleLevelStats() const {
+        return RibbonLevelStats{num_bumped, empty_slots, num_threads_final, sort_time, Size()};
+    }
+
 protected:
     /* NOTE: The internal functions also call the sequential version if num_threads == 0, just in case.
        However, these functions should never be called with num_threads == 0 since the public functions
@@ -230,10 +242,10 @@ protected:
         bool success;
         if constexpr (kUseMHC) {
             if (num_threads <= 1)
-                success = BandingAddRangeMHC(&storage_, hasher_, begin, end, bump_vec);
+                std::tie(success, num_threads_final, sort_time) = BandingAddRangeMHC(&storage_, hasher_, begin, end, bump_vec);
             #ifdef _REENTRANT
             else
-                success = BandingAddRangeParallelMHC(&storage_, hasher_, begin, end, bump_vec, num_threads);
+                std::tie(success, num_threads_final, sort_time) = BandingAddRangeParallelMHC(&storage_, hasher_, begin, end, bump_vec, num_threads);
             #else
             else {
                 std::cerr << "Parallel version called but not compiled in. This should be impossible.\n";
@@ -242,10 +254,10 @@ protected:
             #endif
         } else {
             if (num_threads <= 1)
-                success = BandingAddRange(&storage_, hasher_, begin, end, bump_vec);
+                std::tie(success, num_threads_final, sort_time) = BandingAddRange(&storage_, hasher_, begin, end, bump_vec);
             #ifdef _REENTRANT
             else
-                success = BandingAddRangeParallel(&storage_, hasher_, begin, end, bump_vec, num_threads);
+                std::tie(success, num_threads_final, sort_time) = BandingAddRangeParallel(&storage_, hasher_, begin, end, bump_vec, num_threads);
             #else
             else {
                 std::cerr << "Parallel version called but not compiled in. This should be impossible.\n";
@@ -394,6 +406,8 @@ protected:
     // statistics
     ssize_t num_bumped;
     ssize_t empty_slots;
+    size_t num_threads_final;
+    uint64_t sort_time;
 
     // actual data
     double slots_per_item_;
@@ -544,21 +558,18 @@ public:
         return Super::Size() + child_ribbon_.Size();
     }
 
-    /* GetStats only returns information for the top-level ribbon */
-    ssize_t GetTotalNumBumped() const {
-        return Super::num_bumped + child_ribbon_.GetTotalNumBumped();
-    }
-
-    ssize_t GetBaseCaseEmptySlots() const {
-        return child_ribbon_.GetBaseCaseEmptySlots();
-    }
-
     /*
     void PrintStats() const {
         Super::PrintStats();
         child_ribbon_.PrintStats();
     }
     */
+
+    std::vector<RibbonLevelStats> GetLevelStats() const {
+        auto stats = child_ribbon_.GetLevelStats();
+        stats.push_back(Super::GetSingleLevelStats());
+        return stats;
+    }
 
 protected:
     template <typename Iterator, typename C = Config>
@@ -741,12 +752,10 @@ public:
         return result;
     }
 
-    ssize_t GetTotalNumBumped() const {
-        return 0;
-    }
-
-    ssize_t GetBaseCaseEmptySlots() const {
-        return Super::empty_slots;
+    std::vector<RibbonLevelStats> GetLevelStats() const {
+        std::vector<RibbonLevelStats> stats;
+        stats.push_back(Super::GetSingleLevelStats());
+        return stats;
     }
 
 protected:

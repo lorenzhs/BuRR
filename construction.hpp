@@ -634,7 +634,7 @@ bool AddRangeInternalMHC(
 
 template <typename BandingStorage, typename Hasher, typename Iterator,
           typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>, typename F, typename G>
-bool BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
+std::tuple<bool, size_t, uint64_t> BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
                      Iterator end, BumpStorage *bump_vec, F process_func, G sort_func) {
     using Index = typename BandingStorage::Index;
     constexpr bool oneBitThresh = Hasher::kThreshMode == ThreshMode::onebit;
@@ -643,7 +643,7 @@ bool BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
     constexpr bool log = Hasher::log;
 
     if (begin == end)
-        return true;
+        return std::make_tuple(true, 1, 0);
 
     rocksdb::StopWatchNano timer(true);
     const Index num_starts = bs->GetNumStarts();
@@ -667,14 +667,15 @@ bool BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
     LOGC(log) << "\tInput transformation took "
               << timer.ElapsedNanos(true) / 1e6 << "ms";
     sort_func(input.get(), input.get() + num_items);
-    LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
+    auto sort_time = timer.ElapsedNanos(true);
+    LOGC(log) << "\tSorting took " << sort_time / 1e6 << "ms";
 
     bool success = AddRangeInternal<false>(
         bs, hasher, 0, num_buckets, 0, num_items, input,
         begin, bump_vec, 0, 0, 0, 0
     );
     if (!success)
-        return false;
+        return std::make_tuple(false, 1, sort_time);
 
     // migrate thresholds to hash table
     if constexpr (oneBitThresh) {
@@ -683,12 +684,12 @@ bool BandingAddRangeBase(BandingStorage *bs, Hasher &hasher, Iterator begin,
 
     LOGC(log) << "\tActual insertion took " << timer.ElapsedNanos(true) / 1e6
               << "ms";
-    return true;
+    return std::make_tuple(true, 1, sort_time);
 }
 
 template <typename BandingStorage, typename Hasher, typename Iterator,
           typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
-bool BandingAddRange(BandingStorage *bs, Hasher &hasher, Iterator begin,
+std::tuple<bool, size_t, uint64_t> BandingAddRange(BandingStorage *bs, Hasher &hasher, Iterator begin,
                      Iterator end, BumpStorage *bump_vec) {
     return BandingAddRangeBase(bs, hasher, begin, end, bump_vec,
         [&](BandingStorage *bs, Hasher &hasher, auto &input, Iterator begin, Iterator end) {
@@ -1008,7 +1009,7 @@ inline void AddRangeParallelInternal(
 #ifdef _REENTRANT
 template <typename BandingStorage, typename Hasher, typename Iterator,
           typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
-bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
+std::tuple<bool, size_t, uint64_t> BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
                      Iterator end, BumpStorage *bump_vec, std::size_t num_threads) {
     using Index = typename BandingStorage::Index;
     constexpr Index kMinBucketsPerThread = BandingStorage::kMinBucketsPerThread;
@@ -1034,7 +1035,7 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     constexpr bool log = Hasher::log;
 
     if (begin == end)
-        return true;
+        return std::make_tuple(true, num_threads, 0);
 
     /* These two lambdas are used to still perform the preprocessing and sorting in
        parallel even when the sequential insertion is used (i.e. when we are in the
@@ -1100,17 +1101,18 @@ bool BandingAddRangeParallel(BandingStorage *bs, Hasher &hasher, Iterator begin,
     LOGC(log) << "\tInput transformation took "
               << timer.ElapsedNanos(true) / 1e6 << "ms";
     sort_parallel(input.get(), input.get() + num_items);
-    LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
+    auto sort_time = timer.ElapsedNanos(true);
+    LOGC(log) << "\tSorting took " << sort_time / 1e6 << "ms";
     AddRangeParallelInternal(bs, hasher, std::move(input), begin, end, bump_vec, num_threads);
     LOGC(log) << "\tActual insertion took " << timer.ElapsedNanos(true) / 1e6
               << "ms";
-    return true;
+    return std::make_tuple(true, num_threads, sort_time);
 }
 #endif
 
 template <typename BandingStorage, typename Hasher, typename Iterator,
           typename BumpStorage = std::vector<typename Hasher::mhc_t>, typename F>
-bool BandingAddRangeBaseMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
+std::tuple<bool, size_t, uint64_t> BandingAddRangeBaseMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
                         Iterator end, BumpStorage *bump_vec, F sort_func) {
     static_assert(Hasher::kUseMHC, "you called the wrong method");
 
@@ -1121,7 +1123,7 @@ bool BandingAddRangeBaseMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
     constexpr bool log = Hasher::log;
 
     if (begin == end)
-        return true;
+        return std::make_tuple(true, 1, 0);
 
     rocksdb::StopWatchNano timer(true);
     const auto num_items = end - begin;
@@ -1140,14 +1142,16 @@ bool BandingAddRangeBaseMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
                }) == end);
     }
 
-    LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
+    auto sort_time = timer.ElapsedNanos(true);
+
+    LOGC(log) << "\tSorting took " << sort_time / 1e6 << "ms";
 
     bool success = AddRangeInternalMHC<false>(
         bs, hasher, 0, num_buckets, 0, num_items,
         begin, bump_vec, 0, 0, 0, 0
     );
     if (!success)
-        return false;
+        return std::make_tuple(false, 1, sort_time);
 
     // migrate thresholds to hash table
     if constexpr (oneBitThresh) {
@@ -1156,12 +1160,12 @@ bool BandingAddRangeBaseMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
 
     LOGC(log) << "\tActual insertion took " << timer.ElapsedNanos(true) / 1e6
               << "ms";
-    return true;
+    return std::make_tuple(true, 1, sort_time);
 }
 
 template <typename BandingStorage, typename Hasher, typename Iterator,
           typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
-bool BandingAddRangeMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
+std::tuple<bool, size_t, uint64_t> BandingAddRangeMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
                      Iterator end, BumpStorage *bump_vec) {
     static_assert(Hasher::kUseMHC, "you called the wrong method");
     return BandingAddRangeBaseMHC(
@@ -1173,7 +1177,7 @@ bool BandingAddRangeMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
 #ifdef _REENTRANT
 template <typename BandingStorage, typename Hasher, typename Iterator,
           typename BumpStorage = std::vector<typename std::iterator_traits<Iterator>::value_type>>
-bool BandingAddRangeParallelMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
+std::tuple<bool, size_t, uint64_t> BandingAddRangeParallelMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
                      Iterator end, BumpStorage *bump_vec, std::size_t num_threads) {
     static_assert(Hasher::kUseMHC, "you called the wrong method");
     using Index = typename BandingStorage::Index;
@@ -1200,7 +1204,7 @@ bool BandingAddRangeParallelMHC(BandingStorage *bs, Hasher &hasher, Iterator beg
     constexpr bool log = Hasher::log;
 
     if (begin == end)
-        return true;
+        return std::make_tuple(true, num_threads, 0);
 
     const auto sort_parallel = [num_threads](auto begin, auto end, auto &hasher, auto num_starts) {
         my_sort(begin, end, hasher, num_starts, num_threads);
@@ -1210,7 +1214,6 @@ bool BandingAddRangeParallelMHC(BandingStorage *bs, Hasher &hasher, Iterator beg
         return BandingAddRangeBaseMHC(bs, hasher, begin, end, bump_vec, sort_parallel);
     }
 
-    rocksdb::StopWatchNano timer(true);
     const Index num_buckets = bs->GetNumBuckets();
     const Index num_starts = bs->GetNumStarts();
 
@@ -1225,6 +1228,8 @@ bool BandingAddRangeParallelMHC(BandingStorage *bs, Hasher &hasher, Iterator beg
     sLOG << "Constructing ribbon (MHC) with" << num_buckets
          << "buckets, num_starts =" << num_starts;
 
+    rocksdb::StopWatchNano timer(true);
+
     sort_parallel(begin, end, hasher, num_starts);
     // MHCs should be unique, if not, fail construction
     if constexpr (Hasher::kIsFilter) {
@@ -1234,12 +1239,13 @@ bool BandingAddRangeParallelMHC(BandingStorage *bs, Hasher &hasher, Iterator beg
                    return a.first == b.first;
                }) == end);
     }
-    LOGC(log) << "\tSorting took " << timer.ElapsedNanos(true) / 1e6 << "ms";
+    auto sort_time = timer.ElapsedNanos(true);
+    LOGC(log) << "\tSorting took " << sort_time / 1e6 << "ms";
     /* 0 is just a dummy value where the non-MHC version gets the input */
     AddRangeParallelInternal(bs, hasher, 0, begin, end, bump_vec, num_threads);
     LOGC(log) << "\tActual insertion took " << timer.ElapsedNanos(true) / 1e6
               << "ms";
-    return true;
+    return std::make_tuple(true, num_threads, sort_time);;
 }
 #endif
 
