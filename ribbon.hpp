@@ -15,6 +15,7 @@
 #include "thresh_compress.hpp"
 
 #include <tlx/logger.hpp>
+#include <tlx/define/likely.hpp>
 
 #include <iostream>
 #include <type_traits>
