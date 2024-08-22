@@ -3,6 +3,7 @@
 //  License (found in the LICENSE file in the root directory).
 
 #include "ribbon.hpp"
+#include "serialization.hpp"
 #include "rocksdb/stop_watch.h"
 
 #include <tlx/cmdline_parser.hpp>
@@ -26,8 +27,11 @@ using namespace ribbon;
 
 bool no_queries = false;
 
+// NOTE: When an input file is given, the tests here still require eps and num_slots to
+// be given because otherwise, the number of inserted elements can't be reconstructed.
+
 template <uint8_t depth, typename Config>
-void run(size_t num_slots, double eps, size_t seed, unsigned num_threads) {
+void run(size_t num_slots, double eps, size_t seed, unsigned num_threads, std::string ifile, std::string ofile) {
     IMPORT_RIBBON_CONFIG(Config);
 
     const double slots_per_item = eps + 1.0;
@@ -37,25 +41,32 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads) {
          << " config: L=" << kCoeffBits << " B=" << kBucketSize
          << " r=" << kResultBits;
 
+    ribbon_filter<depth, Config> r;
     rocksdb::StopWatchNano timer(true);
 
-    auto input = std::make_unique<int[]>(num_items);
-    std::iota(input.get(), input.get() + num_items, 0);
-    LOG1 << "Input generation took " << timer.ElapsedNanos(true) / 1e6 << "ms";
+    if (ifile.length() == 0) {
+        auto input = std::make_unique<int[]>(num_items);
+        std::iota(input.get(), input.get() + num_items, 0);
+        LOG1 << "Input generation took " << timer.ElapsedNanos(true) / 1e6 << "ms";
+        r = ribbon_filter<depth, Config>(num_slots, slots_per_item, seed);
+        LOG1 << "Allocation took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
+        LOG1 << "Adding rows to filter....";
+        r.AddRange(input.get(), input.get() + num_items);
+        LOG1 << "Insertion took " << timer.ElapsedNanos(true) / 1e6 << "ms in total\n";
 
-    ribbon_filter<depth, Config> r(num_slots, slots_per_item, seed);
+        input.reset();
 
-    LOG1 << "Allocation took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
-
-    LOG1 << "Adding rows to filter....";
-    r.AddRange(input.get(), input.get() + num_items);
-    LOG1 << "Insertion took " << timer.ElapsedNanos(true) / 1e6 << "ms in total\n";
-
-    input.reset();
-
-    r.BackSubst();
-    LOG1 << "Backsubstitution took " << timer.ElapsedNanos(true) / 1e6
-         << "ms in total\n";
+        r.BackSubst();
+        LOG1 << "Backsubstitution took " << timer.ElapsedNanos(true) / 1e6
+             << "ms in total\n";
+    } else {
+        r.Deserialize(ifile);
+        LOG1 << "Deserialization took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
+    }
+    if (ofile.length() != 0) {
+        r.Serialize(ofile);
+        LOG1 << "Serialization took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
+    }
 
     const size_t bytes = r.Size();
     const double relsize = (bytes * 8 * 100.0) / (num_items * Config::kResultBits);
@@ -230,6 +241,7 @@ int main(int argc, char** argv) {
     bool onebit = false, twobit = false, sparsecoeffs = false, cls = false,
          interleaved = false;
     int shift = 0;
+    std::string ifile, ofile;
     cmd.add_size_t('s', "seed", seed, "random seed");
     cmd.add_size_t('m', "slots", num_slots, "number of slots in the filter");
     cmd.add_unsigned('L', "ribbon_width", ribbon_width, "ribbon width (16/32/64)");
@@ -248,6 +260,8 @@ int main(int argc, char** argv) {
                  "use interleaved solution storage");
     cmd.add_bool('Q', "noqueries", no_queries,
                  "don't run any queries (for scripting)");
+    cmd.add_string('r', "read", ifile, "file to read serialized data");
+    cmd.add_string('w', "write", ofile, "file to write serialized data");
 
     if (!cmd.process(argc, argv) || (onebit && twobit)) {
         cmd.print_usage();
@@ -277,5 +291,5 @@ int main(int argc, char** argv) {
                              : (twobit ? ThreshMode::twobit : ThreshMode::normal);
 
     dispatch(mode, depth, ribbon_width, cls, interleaved, sparsecoeffs, shift,
-             num_slots, eps, seed, num_threads);
+             num_slots, eps, seed, num_threads, ifile, ofile);
 }
