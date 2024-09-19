@@ -23,12 +23,18 @@ public:
 };
 
 static inline __uint128_t bswap128(const __uint128_t& v) {
-#if defined(__GNUC__) && defined(__has_builtin) && __has_builtin(__builtin_bswap128)
-    return __builtin_bswap128(v);
-#else
-    __uint128_t lo = tlx::bswap64(v & 0xFFFFFFFFFFFFFFFFULL);
-    return (lo << 64) | tlx::bswap64(v >> 64);
-#endif
+    #if defined(__GNUC__) && defined(__has_builtin)
+        // Cannot use "&&" directly: Macros do not use short-circuiting
+        #if  __has_builtin(__builtin_bswap128)
+            #define BURR_USE_BSWAP
+        #endif
+    #endif
+    #ifdef BURR_USE_BSWAP
+        return __builtin_bswap128(v);
+    #else
+        __uint128_t lo = tlx::bswap64(v & 0xFFFFFFFFFFFFFFFFULL);
+        return (lo << 64) | tlx::bswap64(v >> 64);
+    #endif
 }
 
 template <typename T>
