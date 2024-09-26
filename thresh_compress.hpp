@@ -230,8 +230,11 @@ public:
             }
         } else {
             for (auto it = plus_->begin(); it != plus_->end(); it++) {
-                os.write(reinterpret_cast<const char *>(it->first), sizeof(Index));
-                os.write(reinterpret_cast<const char *>(it->second), sizeof(Index));
+                // the keys are offset by one in Finalise, so one needs to be
+                // subtracted again here
+                Index key = it->first - 1;
+                os.write(reinterpret_cast<const char *>(&key), sizeof(Index));
+                os.write(reinterpret_cast<const char *>(&it->second), sizeof(Index));
             }
         }
     }
