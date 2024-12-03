@@ -10,6 +10,10 @@ BuRR is a static retrieval and approximate membership query data structure with 
 
 Make sure to fetch all submodules with `git submodule update --init --recursive`, then type `make bench` to compile a benchmark runner that includes a wide range of configurations, or `make tests` to compile the test suite.  The scripts used in the evaluation are located in the `scripts` folder.  You may also want to refer to [the fastfilter_cpp repository](https://github.com/lorenzhs/fastfilter_cpp) for a comparison to other filter data structures and more benchmarks used in our paper.
 
+## Parallel implementation
+
+You can find a parallel implementation on the [`parallel` branch](https://github.com/lorenzhs/BuRR/tree/parallel) and its brief announcement paper on [arXiv](https://arxiv.org/abs/2411.12365).
+
 ## Citation
 
 If you use BuRR in the context of an academic publication, we ask that you please cite our paper:
