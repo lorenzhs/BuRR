@@ -484,8 +484,8 @@ protected:
     }
 
     // statistics
-    ssize_t num_bumped;
-    ssize_t empty_slots;
+    ssize_t num_bumped = 0;
+    ssize_t empty_slots = 0;
 
     // actual data
     double slots_per_item_;

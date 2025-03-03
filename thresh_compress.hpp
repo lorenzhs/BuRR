@@ -169,7 +169,7 @@ public:
     void Finalise(Index num_buckets) {
         if (buffer_.size() > ht_thresh) {
             plus_ = std::make_unique<table_t>(buffer_.size(), 1.03);
-            for (const auto [bucket, val] : buffer_) {
+            for (const auto &[bucket, val] : buffer_) {
                 // Key 0 not allowed -> offset by 1
                 plus_->insert(bucket + 1, val);
             }
@@ -185,7 +185,7 @@ public:
         if (buffer_.size() > bin_thresh) {
             const Index filter_size = (num_buckets + granularity - 1) / granularity;
             filter_.resize(filter_size);
-            for (const auto [bucket, _] : buffer_) {
+            for (const auto &[bucket, _] : buffer_) {
                 filter_[bucket / granularity] = true;
             }
             size_t c = 0;
