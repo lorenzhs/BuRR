@@ -36,6 +36,14 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads, std::s
 
     const double slots_per_item = eps + 1.0;
     const size_t num_items = num_slots / slots_per_item;
+    // This test isn't perfect, but at least it should catch some common mistakes.
+    if (num_items > std::numeric_limits<Index>::max() || num_items > std::numeric_limits<Key>::max()) {
+        std::cerr << "Input size too large for configured Index or Key type.\n";
+        exit(1);
+    } else if (2 * num_items > std::numeric_limits<Key>::max()) {
+        std::cerr << "Input size * 2 too large for configured Key type, negative queries in this simple test may give inaccurate results.\n";
+        exit(1);
+    }
     LOG1 << "Running simple test with " << num_slots << " slots, eps=" << eps
          << " -> " << num_items << " items, seed=" << seed
          << " config: L=" << kCoeffBits << " B=" << kBucketSize
@@ -45,8 +53,8 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads, std::s
     rocksdb::StopWatchNano timer(true);
 
     if (ifile.length() == 0) {
-        auto input = std::make_unique<int[]>(num_items);
-        std::iota(input.get(), input.get() + num_items, 0);
+        auto input = std::make_unique<Key[]>(num_items);
+        std::iota(input.get(), input.get() + num_items, Key(0));
         LOG1 << "Input generation took " << timer.ElapsedNanos(true) / 1e6 << "ms";
         r = ribbon_filter<depth, Config>(num_slots, slots_per_item, seed);
         LOG1 << "Allocation took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
@@ -79,12 +87,12 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads, std::s
         size_t start = num_items / num_threads * id;
         // don't do the same queries on all threads
         for (size_t v = start; v < num_items; v++) {
-            bool found = r.QueryFilter((int)v);
+            bool found = r.QueryFilter(static_cast<Key>(v));
             assert(found);
             my_ok &= found;
         }
         for (size_t v = 0; v < start; v++) {
-            bool found = r.QueryFilter((int)v);
+            bool found = r.QueryFilter(static_cast<Key>(v));
             assert(found);
             my_ok &= found;
         }
@@ -110,10 +118,10 @@ void run(size_t num_slots, double eps, size_t seed, unsigned num_threads, std::s
         // offset queries between threads
         size_t start = num_items + num_items / num_threads * id;
         for (size_t v = start; v < 2 * num_items; v++) {
-            my_found += r.QueryFilter((int)v);
+            my_found += r.QueryFilter(static_cast<Key>(v));
         }
         for (size_t v = num_items; v < start; v++) {
-            my_found += r.QueryFilter((int)v);
+            my_found += r.QueryFilter(static_cast<Key>(v));
         }
         found.fetch_add(my_found);
     };
