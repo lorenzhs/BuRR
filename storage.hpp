@@ -6,9 +6,12 @@
 #pragma once
 
 #include "config.hpp"
+#include "serialization.hpp"
 
 #include <cassert>
 #include <memory>
+#include <ostream>
+#include <istream>
 
 namespace ribbon {
 
@@ -202,6 +205,30 @@ public:
         return meta_bytes + 2 * sizeof(Index) /* don't count num_buckets */;
     }
 
+    void SerializeIntern(std::ostream &os) const {
+        os.write(reinterpret_cast<const char *>(&num_slots_), sizeof(Index));
+        size_t size = GetMetaSize() + !div_clean;
+        os.write(reinterpret_cast<const char *>(meta_.get()), sizeof(meta_t) * size);
+    }
+
+    void DeserializeIntern(std::istream &is, bool switchendian) {
+        is.read(reinterpret_cast<char *>(&num_slots_), sizeof(Index));
+        if (switchendian && !bswap_generic(num_slots_))
+            throw parse_error("error converting endianness");
+        Index num_starts = num_slots_ - kCoeffBits + 1;
+        num_buckets_ = (num_starts + kBucketSize - 1) / kBucketSize;
+        size_t size = GetMetaSize() + !div_clean;
+        meta_ = std::make_unique<meta_t[]>(size);
+        is.read(reinterpret_cast<char *>(meta_.get()), sizeof(meta_t) * size);
+        if (switchendian && sizeof(meta_t) > 1) {
+            if (!bswap_type_supported<meta_t>())
+                throw parse_error("error converting endianness");
+            for (size_t i = 0; i < size; ++i) {
+                bswap_generic(meta_[i]);
+            }
+        }
+    }
+
 protected:
     size_t GetMetaSize() const {
         return (num_buckets_ * meta_bits + meta_t_bits - 1) / meta_t_bits;
@@ -212,7 +239,7 @@ protected:
     // this is only here so the back substitution can
     // access the thread borders used for the insertion
     std::unique_ptr<Index[]> thread_borders_;
-    std::size_t num_thread_borders_;
+    std::size_t num_thread_borders_ = 0;
 };
 } // namespace
 
@@ -280,6 +307,24 @@ public:
         return Super::num_slots_ * sizeof(ResultRow) + Super::Size();
     }
 
+    void SerializeIntern(std::ostream &os) const {
+        Super::SerializeIntern(os);
+        os.write(reinterpret_cast<const char *>(results_.get()), sizeof(ResultRow) * Super::num_slots_);
+    }
+
+    void DeserializeIntern(std::istream &is, bool switchendian) {
+        Super::DeserializeIntern(is, switchendian);
+        results_ = std::make_unique<ResultRow[]>(Super::num_slots_);
+        is.read(reinterpret_cast<char *>(results_.get()), sizeof(ResultRow) * Super::num_slots_);
+        if (switchendian && sizeof(ResultRow) > 1) {
+            if (!bswap_type_supported<ResultRow>())
+                throw parse_error("error converting endianness");
+            for (Index i = 0; i < Super::num_slots_; ++i) {
+                bswap_generic(results_[i]);
+            }
+        }
+    }
+
 protected:
     std::unique_ptr<CoeffRow[]> coeffs_;
     std::unique_ptr<ResultRow[]> results_;
@@ -333,6 +378,29 @@ public:
     size_t Size() const {
         return GetNumSegments() * sizeof(CoeffRow) + Super::Size();
     };
+
+    void SerializeIntern(std::ostream &os) const {
+        Super::SerializeIntern(os);
+        size_t size = GetNumSegments() * sizeof(CoeffRow);
+        os.write(reinterpret_cast<const char*>(data_.get()), size);
+    }
+
+    void DeserializeIntern(std::istream &is, bool switchendian) {
+        Super::DeserializeIntern(is, switchendian);
+        size_t size = GetNumSegments() * sizeof(CoeffRow);
+        data_ = std::make_unique<unsigned char[]>(size);
+        is.read(reinterpret_cast<char*>(data_.get()), size);
+        if (switchendian && sizeof(CoeffRow) > 1) {
+            if (!bswap_type_supported<CoeffRow>())
+                throw parse_error("error converting endianness");
+            for (Index i = 0; i < GetNumSegments(); ++i) {
+                // this could probably be made a bit more efficient
+                CoeffRow seg = GetSegment(i);
+                bswap_generic(seg);
+                SetSegment(i, seg);
+            }
+        }
+    }
 
 protected:
     std::unique_ptr<unsigned char[]> data_;

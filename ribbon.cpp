@@ -3,6 +3,7 @@
 //  License (found in the LICENSE file in the root directory).
 
 #include "ribbon.hpp"
+#include "serialization.hpp"
 #include "rocksdb/stop_watch.h"
 
 #include <tlx/cmdline_parser.hpp>
@@ -26,38 +27,58 @@ using namespace ribbon;
 
 bool no_queries = false;
 
+// NOTE: When an input file is given, the tests here still require eps and num_slots to
+// be given because otherwise, the number of inserted elements can't be reconstructed.
+
 template <uint8_t depth, typename Config>
-void run(size_t num_items, double eps, size_t seed, unsigned num_threads) {
+void run(size_t num_items, double eps, size_t seed, unsigned num_threads, std::string ifile, std::string ofile) {
     IMPORT_RIBBON_CONFIG(Config);
 
     const double slots_per_item = eps + 1.0;
     const size_t num_slots = num_items * slots_per_item;
+    // This test isn't perfect, but at least it should catch some common mistakes.
+    if (num_items > std::numeric_limits<Index>::max() || num_items > std::numeric_limits<Key>::max()) {
+        std::cerr << "Input size too large for configured Index or Key type.\n";
+        exit(1);
+    } else if (2 * num_items > std::numeric_limits<Key>::max()) {
+        std::cerr << "Input size * 2 too large for configured Key type, negative queries in this simple test may give inaccurate results.\n";
+        exit(1);
+    }
     LOG1 << "Running simple test with " << num_slots << " slots, eps=" << eps
          << " -> " << num_items << " items, seed=" << seed
          << " config: L=" << kCoeffBits << " B=" << kBucketSize
          << " r=" << kResultBits;
 
+    ribbon_filter<depth, Config> r;
     rocksdb::StopWatchNano timer(true);
 
-    auto input = std::make_unique<int[]>(num_items);
-    std::iota(input.get(), input.get() + num_items, 0);
-    LOG1 << "Input generation took " << timer.ElapsedNanos(true) / 1e6 << "ms";
+    uint64_t insertionTime = 0;
+    uint64_t backsubstTime = 0;
+    if (ifile.length() == 0) {
+        auto input = std::make_unique<Key[]>(num_items);
+        std::iota(input.get(), input.get() + num_items, Key(0));
+        LOG1 << "Input generation took " << timer.ElapsedNanos(true) / 1e6 << "ms";
+        r = ribbon_filter<depth, Config>(num_slots, slots_per_item, seed);
+        LOG1 << "Allocation took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
+        LOG1 << "Adding rows to filter (" << num_threads << " threads)....";
+        r.AddRange(input.get(), input.get() + num_items, num_threads);
+        insertionTime = timer.ElapsedNanos(true);
+        LOG1 << "Insertion took " << insertionTime / 1e6 << "ms in total\n";
 
-    ribbon_filter<depth, Config> r(num_slots, slots_per_item, seed);
+        input.reset();
 
-    LOG1 << "Allocation took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
-
-    LOG1 << "Adding rows to filter (" << num_threads << " threads)....";
-    r.AddRange(input.get(), input.get() + num_items, num_threads);
-    uint64_t insertionTime = timer.ElapsedNanos(true);
-    LOG1 << "Insertion took " << insertionTime / 1e6 << "ms in total\n";
-
-    input.reset();
-
-    r.BackSubst(num_threads);
-    uint64_t backsubstTime = timer.ElapsedNanos(true);
-    LOG1 << "Backsubstitution took " << backsubstTime / 1e6
-         << "ms in total\n";
+        r.BackSubst(num_threads);
+        backsubstTime = timer.ElapsedNanos(true);
+        LOG1 << "Backsubstitution took " << backsubstTime / 1e6
+             << "ms in total\n";
+    } else {
+        r.Deserialize(ifile);
+        LOG1 << "Deserialization took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
+    }
+    if (ofile.length() != 0) {
+        r.Serialize(ofile);
+        LOG1 << "Serialization took " << timer.ElapsedNanos(true) / 1e6 << "ms\n";
+    }
 
     const size_t bytes = r.Size();
     const double relsize = (bytes * 8 * 100.0) / (num_items * Config::kResultBits);
@@ -70,12 +91,12 @@ void run(size_t num_items, double eps, size_t seed, unsigned num_threads) {
         size_t start = num_items / num_threads * id;
         // don't do the same queries on all threads
         for (size_t v = start; v < num_items; v++) {
-            bool found = r.QueryFilter((int)v);
+            bool found = r.QueryFilter(static_cast<Key>(v));
             assert(found);
             my_ok &= found;
         }
         for (size_t v = 0; v < start; v++) {
-            bool found = r.QueryFilter((int)v);
+            bool found = r.QueryFilter(static_cast<Key>(v));
             assert(found);
             my_ok &= found;
         }
@@ -101,10 +122,10 @@ void run(size_t num_items, double eps, size_t seed, unsigned num_threads) {
         // offset queries between threads
         size_t start = num_items + num_items / num_threads * id;
         for (size_t v = start; v < 2 * num_items; v++) {
-            my_found += r.QueryFilter((int)v);
+            my_found += r.QueryFilter(static_cast<Key>(v));
         }
         for (size_t v = num_items; v < start; v++) {
-            my_found += r.QueryFilter((int)v);
+            my_found += r.QueryFilter(static_cast<Key>(v));
         }
         found.fetch_add(my_found);
     };
@@ -247,6 +268,7 @@ int main(int argc, char** argv) {
     bool onebit = false, twobit = false, sparsecoeffs = false, cls = false,
          interleaved = false;
     int shift = 0;
+    std::string ifile, ofile;
     cmd.add_size_t('s', "seed", seed, "random seed");
     // Ideally, both settings would be allowed (but mutually exclusive), but it
     // doesn't seem to be // possible to check if an option was set with tlx::CmdlineParser
@@ -268,6 +290,8 @@ int main(int argc, char** argv) {
                  "use interleaved solution storage");
     cmd.add_bool('Q', "noqueries", no_queries,
                  "don't run any queries (for scripting)");
+    cmd.add_string('r', "read", ifile, "file to read serialized data");
+    cmd.add_string('w', "write", ofile, "file to write serialized data");
 
     if (!cmd.process(argc, argv) || (onebit && twobit)) {
         cmd.print_usage();
@@ -297,5 +321,5 @@ int main(int argc, char** argv) {
                              : (twobit ? ThreshMode::twobit : ThreshMode::normal);
 
     dispatch(mode, depth, ribbon_width, cls, interleaved, sparsecoeffs, shift,
-             num_items, eps, seed, num_threads);
+             num_items, eps, seed, num_threads, ifile, ofile);
 }

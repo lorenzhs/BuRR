@@ -13,10 +13,12 @@
 #include "rocksdb/stop_watch.h"
 #include "storage.hpp"
 #include "thresh_compress.hpp"
+#include "serialization.hpp"
 
 #include <tlx/logger.hpp>
 #include <tlx/define/likely.hpp>
 
+#include <fstream>
 #include <iostream>
 #include <type_traits>
 
@@ -403,11 +405,187 @@ protected:
         return input;
     }
 
+    // these (De)SerializeIntern methods are called on each level, while the
+    // (De)Serialize methods below are only called on the top level
+    virtual void SerializeIntern(std::ostream &os) {
+        if constexpr (kUseCacheLineStorage) {
+            throw config_error("kUseCacheLineStorage not supported");
+        } else if constexpr (kUseInterleavedSol) {
+            sol_.SerializeIntern(os);
+        } else {
+            storage_.SerializeIntern(os);
+        }
+        hasher_.SerializeIntern(os);
+    }
+
+    virtual void DeserializeIntern(std::istream &is, bool switchendian, uint64_t seed, uint32_t idx) {
+        Index num_buckets = 0;
+        if constexpr (kUseCacheLineStorage) {
+            throw config_error("kUseCacheLineStorage not supported");
+        } else if constexpr (kUseInterleavedSol) {
+            sol_.DeserializeIntern(is, switchendian);
+            num_buckets = sol_.GetNumBuckets();
+        } else {
+            storage_.DeserializeIntern(is, switchendian);
+            num_buckets = storage_.GetNumBuckets();
+        }
+        hasher_.DeserializeIntern(is, switchendian, num_buckets);
+        if constexpr (Config::kUseMHC) {
+            hasher_.Seed(seed, idx);
+        } else {
+            hasher_.Seed(seed);
+        }
+    }
+
+    // these methods are in ribbon_base so they can still be called by
+    // the base case ribbon
+    void Serialize(std::ostream &os, uint8_t depth) {
+        auto mask = os.exceptions();
+        os.exceptions(~std::ios::goodbit);
+
+        if constexpr (kUseCacheLineStorage)
+            throw config_error("kUseCacheLineStorage not supported");
+
+        os.write("BuRR", 4);
+        uint16_t bom = 0xFEFF;
+        os.write(reinterpret_cast<const char *>(&bom), sizeof(uint16_t));
+        uint16_t version = 0;
+        os.write(reinterpret_cast<const char *>(&version), sizeof(uint16_t));
+
+        char tmp = sizeof(CoeffRow);
+        os.write(&tmp, 1);
+        tmp = sizeof(ResultRow);
+        os.write(&tmp, 1);
+        tmp = kResultBits;
+        os.write(&tmp, 1);
+        tmp = sizeof(Index);
+        os.write(&tmp, 1);
+        os.write(reinterpret_cast<const char *>(&kBucketSize), sizeof(Index));
+        tmp = sizeof(Hash);
+        os.write(&tmp, 1);
+        tmp = static_cast<int>(kThreshMode);
+        os.write(&tmp, 1);
+        unsigned char bits = kUseMultiplyShiftHash | (kIsFilter << 1) |
+              (kFirstCoeffAlwaysOne << 2) | (kSparseCoeffs << 3) |
+              (kUseInterleavedSol << 4) | (kUseMHC << 5);
+        os.write(reinterpret_cast<const char *>(&bits), 1);
+
+        uint8_t d = depth;
+        os.write(reinterpret_cast<const char *>(&d), sizeof(uint8_t));
+        uint64_t seed = this->hasher_.GetSeed();
+        os.write(reinterpret_cast<const char *>(&seed), sizeof(uint64_t));
+
+        // this has to call the overridden method in the child class so
+        // all levels of the data structure are serialized
+        SerializeIntern(os);
+
+        // set exception mask to original mask again
+        os.exceptions(mask);
+    }
+
+    // FIXME: should all internal structures be reset on deserialize?
+    void Deserialize(std::istream &is, uint8_t depth) {
+        auto mask = is.exceptions();
+        is.exceptions(~std::ios::goodbit);
+
+        if constexpr (kUseCacheLineStorage)
+            throw config_error("kUseCacheLineStorage not supported");
+
+        char magic[4];
+        is.read(magic, 4);
+        if (strncmp(magic, "BuRR", 4))
+            throw parse_error("wrong magic number");
+        uint16_t bom;
+        is.read(reinterpret_cast<char *>(&bom), sizeof(uint16_t));
+        bool switchendian = false;
+        if (bom == 0xFFFE)
+            switchendian = true;
+        else if (bom != 0xFEFF)
+            throw parse_error("invalid endianness specification");
+        uint16_t version = 0;
+        is.read(reinterpret_cast<char *>(&version), sizeof(uint16_t));
+        if (version != 0)
+            throw parse_error("invalid version number");
+
+        char tmp;
+        is.read(&tmp, 1);
+        if (tmp != sizeof(CoeffRow))
+            throw config_error("sizeof(CoeffRow) mismatch");
+        is.read(&tmp, 1);
+        if (tmp != sizeof(ResultRow))
+            throw config_error("sizeof(ResultRow) mismatch");
+        is.read(&tmp, 1);
+        if (tmp != kResultBits)
+            throw config_error("kResultBits mismatch");
+        is.read(&tmp, 1);
+        if (tmp != sizeof(Index))
+            throw config_error("sizeof(Index) mismatch");
+        Index bucketsz;
+        is.read(reinterpret_cast<char *>(&bucketsz), sizeof(Index));
+        if (switchendian && !bswap_generic(bucketsz))
+            throw parse_error("error converting endianness of kBucketSize");
+        else if (bucketsz != kBucketSize)
+            throw config_error("kBucketSize mismatch");
+        is.read(&tmp, 1);
+        if (tmp != sizeof(Hash))
+            throw config_error("sizeof(Hash) mismatch");
+        is.read(&tmp, 1);
+        if (tmp != static_cast<int>(kThreshMode))
+            throw config_error("kThreshMode mismatch");
+        // this needs to be unsigned since we use all bits, including the
+        // sign bit if it was signed
+        unsigned char bits;
+        is.read(reinterpret_cast<char *>(&bits), 1);
+        if ((bits & 0x1) != kUseMultiplyShiftHash)
+            throw config_error("kUseMultiplyShiftHash mismatch");
+        else if (((bits >> 1) & 0x1) != kIsFilter)
+            throw config_error("kIsFilter mismatch");
+        else if (((bits >> 2) & 0x1) != kFirstCoeffAlwaysOne)
+            throw config_error("kFirstCoeffAlwaysOne mismatch");
+        else if (((bits >> 3) & 0x1) != kSparseCoeffs)
+            throw config_error("kSparseCoeffs mismatch");
+        else if (((bits >> 4) & 0x1) != kUseInterleavedSol)
+            throw config_error("kUseInterleavedSol mismatch");
+        else if (((bits >> 5) & 0x1) != kUseMHC)
+            throw config_error("kUseMHC mismatch");
+
+        uint8_t d;
+        is.read(reinterpret_cast<char *>(&d), sizeof(uint8_t));
+        if (d != depth)
+            throw config_error("depth mismatch");
+        uint64_t seed;
+        is.read(reinterpret_cast<char *>(&seed), sizeof(uint64_t));
+        if (switchendian && !bswap_generic(seed))
+            throw parse_error("error converting endianness");
+
+        // this has to call the overridden method in the child class so
+        // all levels of the data structure are deserialized
+        DeserializeIntern(is, switchendian, seed, 0);
+
+        // reset exception mask
+        is.exceptions(mask);
+    }
+
+    // convenience methods
+    void Serialize(const std::string &filename, uint8_t depth) {
+        std::ofstream os(filename, std::ios::binary|std::ios::out|std::ios::trunc);
+        if (!os.is_open())
+            throw file_open_error("unable to open file " + filename + " for writing");
+        Serialize(os, depth);
+    }
+
+    void Deserialize(const std::string &filename, uint8_t depth) {
+        std::ifstream is(filename, std::ios::binary|std::ios::in);
+        if (!is.is_open())
+            throw file_open_error("unable to open file " + filename + " for reading");
+        Deserialize(is, depth);
+    }
+
     // statistics
-    ssize_t num_bumped;
-    ssize_t empty_slots;
-    size_t num_threads_final;
-    uint64_t sort_time;
+    ssize_t num_bumped = 0;
+    ssize_t empty_slots = 0;
+    size_t num_threads_final = 1;
+    uint64_t sort_time = 0;
 
     // actual data
     double slots_per_item_;
@@ -443,6 +621,14 @@ public:
     using mhc_or_key_t = typename Super::mhc_or_key_t;
 
     ribbon_filter() = default;
+
+    ribbon_filter(std::istream &is) {
+        Deserialize(is);
+    }
+
+    ribbon_filter(const std::string &filename) {
+        Deserialize(filename);
+    }
 
     // MHC top-level constructor
     template <typename C = Config>
@@ -558,6 +744,22 @@ public:
         return Super::Size() + child_ribbon_.Size();
     }
 
+    void Serialize(const std::string &filename) {
+        Super::Serialize(filename, depth);
+    }
+
+    void Deserialize(const std::string &filename) {
+        Super::Deserialize(filename, depth);
+    }
+
+    void Serialize(std::ostream &os) {
+        Super::Serialize(os, depth);
+    }
+
+    void Deserialize(std::istream &is) {
+        Super::Deserialize(is, depth);
+    }
+
     /*
     void PrintStats() const {
         Super::PrintStats();
@@ -630,6 +832,16 @@ protected:
             bumped_items.data(), bumped_items.data() + bumped_items.size(), num_threads);
     }
 
+    void SerializeIntern(std::ostream &os) override {
+        Super::SerializeIntern(os);
+        child_ribbon_.SerializeIntern(os);
+    }
+
+    void DeserializeIntern(std::istream &is, bool switchendian, uint64_t seed, uint32_t idx) override {
+        Super::DeserializeIntern(is, switchendian, seed, idx);
+        child_ribbon_.DeserializeIntern(is, switchendian, seed + 1, idx + 1);
+    }
+
     ribbon_filter<depth - 1, Config> child_ribbon_;
 
     friend ribbon_filter<depth + 1, Config>;
@@ -646,6 +858,15 @@ public:
     double base_slots_per_item_ = 1.0;
 
     ribbon_filter() = default;
+
+    ribbon_filter(std::istream &is) {
+        Deserialize(is);
+    }
+
+    ribbon_filter(const std::string &filename) {
+        Deserialize(filename);
+    }
+
     ribbon_filter(size_t num_slots, double parent_slots_per_item, uint64_t seed) {
         if constexpr (!Config::kUseMHC) {
             Init(num_slots, parent_slots_per_item, seed);
@@ -756,6 +977,22 @@ public:
         std::vector<RibbonLevelStats> stats;
         stats.push_back(Super::GetSingleLevelStats());
         return stats;
+    }
+
+    void Serialize(const std::string &filename) {
+        Super::Serialize(filename, 0);
+    }
+
+    void Deserialize(const std::string &filename) {
+        Super::Deserialize(filename, 0);
+    }
+
+    void Serialize(std::ostream &os) {
+        Super::Serialize(os, 0);
+    }
+
+    void Deserialize(std::istream &is) {
+        Super::Deserialize(is, 0);
     }
 
 protected:

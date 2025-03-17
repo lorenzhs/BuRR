@@ -57,9 +57,13 @@ void ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::do_sort(
 template class ribbon::Sorter<uint32_t, true, false, ribbon::SorterDummyData>;
 template class ribbon::Sorter<uint32_t, false, false, uint8_t>;
 template class ribbon::Sorter<uint32_t, false, false, uint16_t>;
+template class ribbon::Sorter<uint64_t, true, false, ribbon::SorterDummyData>;
+template class ribbon::Sorter<uint64_t, false, false, uint8_t>;
+template class ribbon::Sorter<uint64_t, false, false, uint16_t>;
 
 // sparse configs - filter only for now
 template class ribbon::Sorter<uint32_t, true, true, ribbon::SorterDummyData>;
+template class ribbon::Sorter<uint64_t, true, true, ribbon::SorterDummyData>;
 /*
 template class ribbon::Sorter<uint32_t, false, true, uint8_t>;
 template class ribbon::Sorter<uint32_t, false, true, uint16_t>;

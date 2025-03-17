@@ -1,0 +1,66 @@
+Description of the binary storage format used for serialization
+===============================================================
+
+WARNING: The binary format is not meant as a robust storage and transfer format,
+it is only meant for temporary serialization. As such, it does not include any
+safeguards to detect data corruption. An additional problem is that most of the
+configuration parameters in BuRR are compile-time constants, meaning that they
+cannot be read from the serialized data. Some of the parameters are still
+included in the format, but only as a safeguard to check that they match the
+compile-time constants that are set. Note, however, that the hash function is
+not checked since it is difficult to serialize a function.
+
+Note on endianness: During serialization, the native byte ordering of the machine
+is always used. During deserialization, the numbers are converted if necessary.
+This means that it is possible to use this format efficiently both on little and
+big endian machines since a conversion only takes place when moving between a
+little and big endian machine. The endianness conversion is currently untested.
+
+File header
+===========
+
+4 bytes: Magic number "BuRR" (encoded in ASCII)
+2 bytes: Byte order mark 0xFEFF to check endianness
+2 bytes: Version number, in case there are 65535 further versions of the format
+         (currently 0)
+
+Configuration options
+=====================
+
+1 byte: sizeof(CoeffRow)
+1 byte: sizeof(ResultRow)
+1 byte: kResultBits
+1 byte: sizeof(Index)
+sizeof(Index) bytes: kBucketSize
+1 byte: sizeof(Hash)
+1 byte: kThreshMode
+All in one byte, ordered from least significant to most significant bit:
+kUseMultiplyShiftHash, kIsFilter, kFirstCoeffAlwaysOne,
+kSparseCoeffs, kUseInterleavedSol, kUseMHC
+
+Note that kUseCacheLineStorage is not supported currently.
+
+Actual data
+===========
+
+1 byte: Depth (since this is a template parameter, it can only be used to check
+        if the depth is the same, not to actually set the parameter)
+8 bytes: Seed
+
+The following parts are repeated for each level of the data structure:
+
+Solution storage:
+-> both storage types: sizeof(Index): number of slots
+                       <meta size>: metadata storage (<meta size> is calculated
+                                    from number of slots and other parameters)
+-> basic storage: sizeof(ResultRow) * number of slots
+-> interleaved storage: <data size> (calculated from number of slots and
+                                    other parameters)
+
+Hasher:
+-> normal thresholds: nothing
+-> 2 bit thresholds:  sizeof(Index) bytes: lower threshold
+                      sizeof(Index) bytes: upper threshold
+-> 1+ bit thresholds: sizeof(Index) bytes: threshold
+                      sizeof(Index) bytes: size of hash table/buffer
+                      2 * sizeof(Index) bytes per hash table/buffer entry

@@ -6,10 +6,13 @@
 
 #include "config.hpp"
 #include "permute.hpp"
+#include "serialization.hpp"
 
 #include <include/cuckoo_simple.h>
 
 #include <memory>
+#include <istream>
+#include <ostream>
 
 namespace ribbon {
 
@@ -41,6 +44,16 @@ public:
             intra_bucket = (intra_bucket >> Permuter_::shift_);
         }
         return intra_bucket == 0 ? 0 : intra_bucket - 1;
+    }
+
+    void SerializeIntern(std::ostream &os) const {
+        (void)os;
+    }
+
+    void DeserializeIntern(std::istream &is, bool switchendian, Index num_buckets) {
+        (void)is;
+        (void)switchendian;
+        (void)num_buckets;
     }
 };
 
@@ -85,6 +98,21 @@ public:
             return 1;
         else // everything bumped
             return 0;
+    }
+
+    void SerializeIntern(std::ostream &os) const {
+        os.write(reinterpret_cast<const char *>(&lower_), sizeof(Index));
+        os.write(reinterpret_cast<const char *>(&upper_), sizeof(Index));
+    }
+
+    void DeserializeIntern(std::istream &is, bool switchendian, Index num_buckets) {
+        (void)num_buckets;
+        is.read(reinterpret_cast<char *>(&lower_), sizeof(Index));
+        if (switchendian && !bswap_generic(lower_))
+            throw parse_error("error converting endianness");
+        is.read(reinterpret_cast<char *>(&upper_), sizeof(Index));
+        if (switchendian && !bswap_generic(upper_))
+            throw parse_error("error converting endianness");
     }
 
     /*
@@ -141,7 +169,7 @@ public:
     void Finalise(Index num_buckets) {
         if (buffer_.size() > ht_thresh) {
             plus_ = std::make_unique<table_t>(buffer_.size(), 1.03);
-            for (const auto [bucket, val] : buffer_) {
+            for (const auto &[bucket, val] : buffer_) {
                 // Key 0 not allowed -> offset by 1
                 plus_->insert(bucket + 1, val);
             }
@@ -157,7 +185,7 @@ public:
         if (buffer_.size() > bin_thresh) {
             const Index filter_size = (num_buckets + granularity - 1) / granularity;
             filter_.resize(filter_size);
-            for (const auto [bucket, _] : buffer_) {
+            for (const auto &[bucket, _] : buffer_) {
                 filter_[bucket / granularity] = true;
             }
             size_t c = 0;
@@ -187,6 +215,55 @@ public:
     size_t Size() const {
         size_t capacity = (plus_ == nullptr) ? buffer_.size() : plus_->capacity;
         return capacity * sizeof(Index) * 2 + (filter_.size() + 7) / 8;
+    }
+
+    // unfortunately, this can't be const because there appears to be a bug in the
+    // implementation of const iterators in DySECT
+    void SerializeIntern(std::ostream &os) {
+        os.write(reinterpret_cast<const char *>(&thresh_), sizeof(Index));
+        std::size_t buffer_sz = NumEntries();
+        os.write(reinterpret_cast<const char *>(&buffer_sz), sizeof(std::size_t));
+        if (plus_ == nullptr) {
+            for (const auto& e : buffer_) {
+                os.write(reinterpret_cast<const char *>(&e.first), sizeof(Index));
+                os.write(reinterpret_cast<const char *>(&e.second), sizeof(Index));
+            }
+        } else {
+            for (auto it = plus_->begin(); it != plus_->end(); it++) {
+                // the keys are offset by one in Finalise, so one needs to be
+                // subtracted again here
+                Index key = it->first - 1;
+                os.write(reinterpret_cast<const char *>(&key), sizeof(Index));
+                os.write(reinterpret_cast<const char *>(&it->second), sizeof(Index));
+            }
+        }
+    }
+
+    void DeserializeIntern(std::istream &is, bool switchendian, Index num_buckets) {
+        is.read(reinterpret_cast<char *>(&thresh_), sizeof(Index));
+        if (switchendian && !bswap_generic(thresh_))
+            throw parse_error("error converting endianness");
+        std::size_t buffer_sz = 0;
+        is.read(reinterpret_cast<char *>(&buffer_sz), sizeof(std::size_t));
+        if (switchendian && !bswap_generic(buffer_sz))
+            throw parse_error("error converting endianness");
+        buffer_.reserve(buffer_sz);
+        Index key, value;
+        /* NOTE: This could technically be improved a bit by storing whether the hash table
+           or buffer was saved - if it was the original buffer, it doesn't need to be sorted
+           again */
+        for (std::size_t i = 0; i < buffer_sz; ++i) {
+            is.read(reinterpret_cast<char *>(&key), sizeof(Index));
+            // a call to bswap_type_supported is unnecessary because previous
+            // calls to bswap_generic already check that Index is supported
+            if (switchendian)
+                bswap_generic(key);
+            is.read(reinterpret_cast<char *>(&value), sizeof(Index));
+            if (switchendian)
+                bswap_generic(value);
+            buffer_.emplace_back(key, value);
+        }
+        Finalise(num_buckets);
     }
 
 protected:

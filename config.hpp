@@ -79,7 +79,8 @@ constexpr unsigned thresh_meta_bits =
     /* Some more additions */                                                   \
     [[maybe_unused]] static constexpr auto kCoeffBits =                         \
         static_cast<Index>(sizeof(CoeffRow) * 8U);                              \
-    [[maybe_unused]] static constexpr auto kResultBits = Config::kResultBits;   \
+    [[maybe_unused]] static constexpr auto kResultBits =                        \
+        RibbonConfig::kResultBits;                                              \
     [[maybe_unused]] static constexpr Index kBucketSize =                       \
         RibbonConfig::kBucketSize;                                              \
     [[maybe_unused]] static constexpr Index kMinBucketsPerThread =              \

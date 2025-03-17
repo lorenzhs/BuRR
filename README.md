@@ -10,6 +10,32 @@ BuRR is a static retrieval and approximate membership query data structure with 
 
 Make sure to fetch all submodules with `git submodule update --init --recursive`, then type `make bench` to compile a benchmark runner that includes a wide range of configurations, or `make tests` to compile the test suite.  The scripts used in the evaluation are located in the `scripts` folder.  You may also want to refer to [the fastfilter_cpp repository](https://github.com/lorenzhs/fastfilter_cpp) for a comparison to other filter data structures and more benchmarks used in our paper.
 
+The library can be used similar to the following example:
+
+```cpp
+std::vector<std::pair<uint64_t, uint8_t>> data;
+data.emplace_back(0xabc, 0); // Key has to be a hash value
+data.emplace_back(0xdef, 1);
+
+using namespace ribbon;
+using Config = FastRetrievalConfig</* result bits */ 1, uint64_t>;
+using RibbonT = ribbon_filter</* depth */ 2, Config>;
+RibbonT retrievalDs(data.size(), /* overload factor */ 0.965, /* seed */ 42);
+
+// Construction
+retrievalDs.AddRange(data.begin(), data.end());
+retrievalDs.BackSubst();
+
+// Queries
+std::cout << (int) retrievalDs.QueryRetrieval(0xabc) << std::endl; // 0
+std::cout << (int) retrievalDs.QueryRetrieval(0xdef) << std::endl; // 1
+```
+
+## Enhancements
+
+- You can find a parallel implementation on the [`parallel` branch](https://github.com/lorenzhs/BuRR/tree/parallel) and its brief announcement paper on [arXiv](https://arxiv.org/abs/2411.12365).
+- [SimpleRibbon](https://github.com/ByteHamster/SimpleRibbon) is a wrapper around BuRR that offers cmake support for setting up dependencies, as well as a non-header library to reduce compile times.
+
 ## Citation
 
 If you use BuRR in the context of an academic publication, we ask that you please cite our paper:
