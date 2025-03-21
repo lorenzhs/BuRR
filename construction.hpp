@@ -455,7 +455,7 @@ bool AddRangeInternalMHC(
         vec.clear();
     };
 
-    Index last_bucket = 0;
+    Index last_bucket = start_bucket;
     bool all_good = true;
     Index thresh = Hasher::NoBumpThresh();
     // Bump cache (row, input item) pairs that may have to be bumped retroactively
