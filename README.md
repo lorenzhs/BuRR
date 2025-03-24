@@ -13,6 +13,8 @@ Make sure to fetch all submodules with `git submodule update --init --recursive`
 The library can be used similar to the following example:
 
 ```cpp
+#include "ribbon.hpp"
+
 std::vector<std::pair<uint64_t, uint8_t>> data;
 data.emplace_back(0xabc, 0); // Key has to be a hash value
 data.emplace_back(0xdef, 1);
