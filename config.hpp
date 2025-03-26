@@ -294,7 +294,7 @@ template <size_t coeff_bits, size_t result_bits, ThreshMode mode = ThreshMode::t
 struct RConfig
     : public DefaultConfig<at_least_t<coeff_bits>, at_least_t<result_bits>, Key> {
     using Super =
-        DefaultConfig<at_least_t<coeff_bits>, at_least_t<result_bits>, int>;
+        DefaultConfig<at_least_t<coeff_bits>, at_least_t<result_bits>, Key>;
     using Index = uint32_t;
     static constexpr Index kResultBits = result_bits;
     static constexpr ThreshMode kThreshMode =
