@@ -206,12 +206,12 @@ bool BandingAddRange(BandingStorage *bs, Hasher &hasher, Iterator begin,
 
 #ifndef RIBBON_PASS_HASH
         const Hash hash = hasher.GetHash(next);
-        if (i + 1 < num_items)
+        if (i + 1 < static_cast<Index>(num_items))
             next = *(begin + input[i + 1].second);
 
         // prefetch the cache miss far in advance, assuming the iterator
         // is to contiguous storage
-        if (TLX_LIKELY(i + 32 < num_items))
+        if (TLX_LIKELY(i + 32 < static_cast<Index>(num_items)))
             __builtin_prefetch(&*begin + input[i + 32].second, 0, 1);
 #endif
 
@@ -395,7 +395,7 @@ bool BandingAddRangeMHC(BandingStorage *bs, Hasher &hasher, Iterator begin,
     [[maybe_unused]] Index last_val = -1;
     [[maybe_unused]] std::conditional_t<oneBitThresh, decltype(bump_cache), int> unc_bump_cache;
 
-    for (Index i = 0; i < num_items; ++i) {
+    for (Index i = 0; i < static_cast<Index>(num_items); ++i) {
         const auto mhc = *(begin + i);
         const auto hash = hasher.GetHash(mhc);
         const Index start = hasher.GetStart(hash, num_starts),
