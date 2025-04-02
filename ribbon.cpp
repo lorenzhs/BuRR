@@ -24,6 +24,7 @@
 #endif
 
 using namespace ribbon;
+using Key = int;
 
 bool no_queries = false;
 
@@ -178,13 +179,13 @@ template <ThreshMode mode, uint8_t depth, size_t L, size_t r, bool interleaved,
 void dispatch_shift(int shift, Args&... args) {
     switch (shift) {
         case 0:
-            run<depth, RConfig<L, r, mode, sparse, interleaved, cls, 0>>(args...);
+            run<depth, RConfig<L, r, mode, sparse, interleaved, cls, 0, Key>>(args...);
             break;
         case -1:
-            run<depth, RConfig<L, r, mode, sparse, interleaved, cls, -1>>(args...);
+            run<depth, RConfig<L, r, mode, sparse, interleaved, cls, -1, Key>>(args...);
             break;
         case 1:
-            run<depth, RConfig<L, r, mode, sparse, interleaved, cls, 1>>(args...);
+            run<depth, RConfig<L, r, mode, sparse, interleaved, cls, 1, Key>>(args...);
             break;
         default: LOG1 << "Unsupported bucket size shift: " << shift;
     }
