@@ -59,8 +59,27 @@ public:
         }
     }
 
-    inline Hash GetHash(const std::pair<Key, ResultRow>& in) const {
+    inline Index GetVLRIndex(Hash hash, Index num_ribbons) const {
+        uint64_t key = static_cast<uint64_t>(hash);
+        // 13th variant from https://zimbry.blogspot.com/2011/09/better-bit-mixing-improving-on.html
+        key ^= (key >> 30);
+        key *= 0xbf58476d1ce4e5b9;
+        key ^= (key >> 27);
+        key *= 0x94d049bb133111eb;
+        key ^= (key >> 31);
+
+        return rocksdb::FastRangeGeneric(key, num_ribbons);
+    }
+
+    inline Hash GetHash(const std::pair<Key, std::conditional_t<kUseVLR, ResultRowVLR, ResultRow>>& in) const {
         return GetHash(in.first);
+    }
+
+    // For VLR non-kVLRShareMeta version where bump mask is stored with keys and values
+    inline Hash GetHash(const std::tuple<Key, ResultRowVLR, ResultRowVLR> &in) const {
+        assert(!kIsFilter);
+        assert(kUseVLR && !kVLRShareMeta);
+        return GetHash(std::get<0>(in));
     }
 
     // this has to be fast
@@ -127,13 +146,23 @@ public:
         return in.second;
     }
 
+    inline ResultRowVLR GetResultRowVLRFromInput(const std::pair<Key, ResultRowVLR>& in) const {
+        // simple extraction
+        return in.second;
+    }
+
+    // This is needed for the VLR non-kVLRShareMeta case when the bump mask is stored together with the input.
+    inline ResultRowVLR GetResultRowVLRFromInput(const std::tuple<Key, ResultRowVLR, ResultRowVLR>& in) const {
+        return std::get<1>(in);
+    }
+
     // needed for serialization
     inline uint64_t GetSeed() const {
         return seed_;
     }
 
 protected:
-    uint64_t seed_;
+    uint64_t seed_, seed_vlr_;
     std::conditional_t<kUseMultiplyShiftHash, __uint128_t, DummyData> multiply_,
         add_;
     // For expanding hash: large random prime, congruent 1 modulo 4
@@ -197,9 +226,33 @@ public:
             (static_cast<__uint128_t>(mhc) * static_cast<__uint128_t>(fct_)) >> 32);
     }
 
+    inline Index GetVLRIndex(hash_t hash, Index num_ribbons) const {
+        uint64_t key = static_cast<uint64_t>(hash);
+        // 13th variant from https://zimbry.blogspot.com/2011/09/better-bit-mixing-improving-on.html
+        key ^= (key >> 30);
+        key *= 0xbf58476d1ce4e5b9;
+        key ^= (key >> 27);
+        key *= 0x94d049bb133111eb;
+        key ^= (key >> 31);
+
+        return rocksdb::FastRangeGeneric(key, num_ribbons);
+    }
+
     inline hash_t GetHash(const std::pair<mhc_t, ResultRow>& p) const {
         assert(!kIsFilter);
         return GetHash(p.first);
+    }
+
+    inline hash_t GetHash(const std::pair<mhc_t, ResultRowVLR>& p) const {
+        assert(!kIsFilter);
+        return GetHash(p.first);
+    }
+
+    // This is needed for the VLR MHC case when the bump mask is stored together with the input.
+    inline hash_t GetHash(const std::tuple<mhc_t, ResultRowVLR, ResultRowVLR>& p) const {
+        assert(!kIsFilter);
+        assert(kUseVLR && !kVLRShareMeta);
+        return GetHash(std::get<0>(p));
     }
 
     // Get MHC
@@ -259,14 +312,23 @@ public:
     }
 
     // makes no sense for filters
-    inline ResultRow GetResultRowFromInput(const Key&) const {
+    inline ResultRow GetResultRowFromInput(const mhc_t&) const {
         assert(false);
         return 0;
     }
 
-    inline ResultRow GetResultRowFromInput(const std::pair<Key, ResultRow>& in) const {
+    inline ResultRow GetResultRowFromInput(const std::pair<mhc_t, ResultRow>& in) const {
         // simple extraction
         return in.second;
+    }
+
+    inline ResultRowVLR GetResultRowVLRFromInput(const std::pair<mhc_t, ResultRowVLR>& in) const {
+        return in.second;
+    }
+
+    // This is needed for the VLR MHC case when the bump mask is stored together with the input.
+    inline ResultRowVLR GetResultRowVLRFromInput(const std::tuple<mhc_t, ResultRowVLR, ResultRowVLR>& in) const {
+        return std::get<1>(in);
     }
 
     uint64_t GetFactor() const {

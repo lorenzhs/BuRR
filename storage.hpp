@@ -39,11 +39,19 @@ public:
     static constexpr Index shift_mask = items_per_fetch - 1;
 
 
-    void Prepare(size_t num_slots) {
+    // FIXME: maybe make separate function for kUseVLR so num_ribbons can't
+    // be set to anything != 1 when kUseVLR is false
+    void Prepare(size_t num_slots, Index num_ribbons = 1) {
         assert(num_slots >= kCoeffBits);
         num_slots_ = num_slots;
         Index num_starts = num_slots - kCoeffBits + 1;
         num_buckets_ = (num_starts + kBucketSize - 1) / kBucketSize;
+
+        if constexpr (kUseVLR)
+            assert(num_ribbons > 0);
+        else
+            assert(num_ribbons == 1);
+        num_ribbons_ = num_ribbons;
 
         // +!div_clean at the end so we don't fetch beyond the bounds, even if
         // we don't use it
@@ -51,32 +59,59 @@ public:
         sLOGC(Config::log) << "Meta: allocating" << size << "entries of"
                            << sizeof(meta_t) << "Bytes each";
         meta_ = std::make_unique<meta_t[]>(size);
+
         if constexpr (kThreshMode == ThreshMode::onebit) {
-            assert(size == (num_buckets_ + 7) / 8);
+            if constexpr (kUseVLR && !kVLRShareMeta)
+                assert(size == (num_buckets_ * num_ribbons + 7) / 8);
+            else
+                assert(size == (num_buckets_ + 7) / 8);
         } else if constexpr (kThreshMode == ThreshMode::twobit) {
-            assert(size == (num_buckets_ + 3) / 4);
+            if constexpr (kUseVLR && !kVLRShareMeta)
+                assert(size == (num_buckets_ * num_ribbons + 3) / 4);
+            else
+                assert(size == (num_buckets_ + 3) / 4);
         }
     }
     void Reset() {
         meta_.reset();
     }
 
-    inline void PrefetchMeta(Index bucket) const {
-        const Index fetch_bucket = div_clean ? bucket / items_per_fetch
-                                             : bucket * meta_bits / meta_t_bits;
+    inline void PrefetchMeta(Index bucket, [[maybe_unused]] Index ribbon_idx = 0) const {
+        Index fetch_bucket;
+        if constexpr (kUseVLR && !kVLRShareMeta) {
+            assert(ribbon_idx < num_ribbons_);
+            fetch_bucket = div_clean ? (bucket * num_ribbons_ + ribbon_idx) / items_per_fetch
+                                     : ((bucket * num_ribbons_ + ribbon_idx) * meta_bits) / meta_t_bits;
+        } else {
+            fetch_bucket = div_clean ? bucket / items_per_fetch
+                                     : bucket * meta_bits / meta_t_bits;
+        }
         __builtin_prefetch(meta_.get() + fetch_bucket,
                            /* rw */ 0, /* locality */ 1);
     }
-    inline meta_t GetMeta(Index bucket) const {
+    inline meta_t GetMeta(Index bucket, Index ribbon_idx = 0) const {
         assert(bucket < num_buckets_);
         if constexpr (div_clean) {
-            const meta_t fetch = meta_[bucket / items_per_fetch];
-            const unsigned shift = meta_bits * (bucket & shift_mask);
-            assert(shift < fetch_bits);
-            return (fetch >> shift) & extractor_mask;
+            if constexpr (kUseVLR && !kVLRShareMeta) {
+                assert(ribbon_idx < num_ribbons_);
+                const meta_t fetch = meta_[(bucket * num_ribbons_ + ribbon_idx) / items_per_fetch];
+                const unsigned shift = meta_bits * ((bucket * num_ribbons_ + ribbon_idx) & shift_mask);
+                assert(shift < fetch_bits);
+                return (fetch >> shift) & extractor_mask;
+            } else {
+                const meta_t fetch = meta_[bucket / items_per_fetch];
+                const unsigned shift = meta_bits * (bucket & shift_mask);
+                assert(shift < fetch_bits);
+                return (fetch >> shift) & extractor_mask;
+            }
         } else {
             // find the fetch position first
-            Index start_bit = bucket * meta_bits;
+            Index start_bit;
+            if constexpr (kUseVLR && !kVLRShareMeta) {
+                start_bit = (bucket * num_ribbons_ + ribbon_idx) * meta_bits;
+            } else {
+                start_bit = bucket * meta_bits;
+            }
             Index fetch_bucket = start_bit / meta_t_bits;
             fetch_t fetch;
             memcpy(&fetch, meta_.get() + fetch_bucket, sizeof(fetch_t));
@@ -85,17 +120,29 @@ public:
             return (fetch >> start_bit) & extractor_mask;
         }
     }
-    inline void SetMeta(Index bucket, meta_t val) {
+    inline void SetMeta(Index bucket, meta_t val, Index ribbon_idx = 0) {
         assert(bucket < num_buckets_);
         assert(val <= extractor_mask);
         if constexpr (div_clean) {
-            const Index pos = bucket / items_per_fetch;
-            const unsigned shift = meta_bits * (bucket & shift_mask);
-            meta_[pos] &= ~static_cast<meta_t>(extractor_mask << shift);
-            meta_[pos] |= (val << shift);
+            if constexpr (kUseVLR && !kVLRShareMeta) {
+                const Index pos = (bucket * num_ribbons_ + ribbon_idx) / items_per_fetch;
+                const unsigned shift = meta_bits * ((bucket * num_ribbons_ + ribbon_idx) & shift_mask);
+                meta_[pos] &= ~static_cast<meta_t>(extractor_mask << shift);
+                meta_[pos] |= (val << shift);
+            } else {
+                const Index pos = bucket / items_per_fetch;
+                const unsigned shift = meta_bits * (bucket & shift_mask);
+                meta_[pos] &= ~static_cast<meta_t>(extractor_mask << shift);
+                meta_[pos] |= (val << shift);
+            }
         } else {
             // find the fetch position first
-            Index start_bit = bucket * meta_bits;
+            Index start_bit;
+            if constexpr (kUseVLR && !kVLRShareMeta) {
+                start_bit = (bucket * num_ribbons_ + ribbon_idx) * meta_bits;
+            } else {
+                start_bit = bucket * meta_bits;
+            }
             Index fetch_bucket = start_bit / meta_t_bits;
             // start_bit now indicates which bits of 'fetch' we need
             start_bit -= fetch_bucket * meta_t_bits;
@@ -104,7 +151,7 @@ public:
             *fetch &= ~(extractor_mask << start_bit);
             *fetch |= (val << start_bit);
         }
-        assert(GetMeta(bucket) == val);
+        assert(GetMeta(bucket, ribbon_idx) == val);
     }
 
     // invalidates other->meta_!
@@ -118,6 +165,8 @@ public:
     inline Index GetNumSlots() const { return num_slots_; }
     inline Index GetNumStarts() const { return num_slots_ - kCoeffBits + 1; }
     inline Index GetNumBuckets() const { return num_buckets_; }
+    template <bool uv = kUseVLR>
+    std::enable_if_t<uv, Index> GetNumRibbons() const { return num_ribbons_; }
     // clang-format on
 
     size_t Size() const {
@@ -129,11 +178,13 @@ public:
 
     void SerializeIntern(std::ostream &os) const {
         os.write(reinterpret_cast<const char *>(&num_slots_), sizeof(Index));
+        // FIXME: !div_clean is probably not needed here
         size_t size = GetMetaSize() + !div_clean;
         os.write(reinterpret_cast<const char *>(meta_.get()), sizeof(meta_t) * size);
     }
 
-    void DeserializeIntern(std::istream &is, bool switchendian) {
+    void DeserializeIntern(std::istream &is, bool switchendian, Index num_ribbons = 1) {
+        num_ribbons_ = num_ribbons;
         is.read(reinterpret_cast<char *>(&num_slots_), sizeof(Index));
         if (switchendian && !bswap_generic(num_slots_))
             throw parse_error("error converting endianness");
@@ -153,10 +204,14 @@ public:
 
 protected:
     size_t GetMetaSize() const {
-        return (num_buckets_ * meta_bits + meta_t_bits - 1) / meta_t_bits;
+        if constexpr (kUseVLR && !kVLRShareMeta)
+            return (num_buckets_ * num_ribbons_ * meta_bits + meta_t_bits - 1) / meta_t_bits;
+        else
+            return (num_buckets_ * meta_bits + meta_t_bits - 1) / meta_t_bits;
     }
     // num_buckets_ is for debugging only & can be recomputed easily
     Index num_slots_ = 0, num_buckets_ = 0;
+    Index num_ribbons_ = 1;
     std::unique_ptr<meta_t[]> meta_;
 };
 } // namespace
@@ -165,6 +220,7 @@ template <typename Config>
 class BasicStorage : public MetaStorage<Config> {
 public:
     IMPORT_RIBBON_CONFIG(Config);
+    static constexpr unsigned result_row_bits = sizeof(ResultRow) * 8U;
     using Super = MetaStorage<Config>;
 
     BasicStorage() = default;
@@ -173,11 +229,19 @@ public:
             Prepare(num_slots);
     }
 
-    void Prepare(size_t num_slots) {
-        Super::Prepare(num_slots);
+    void Prepare(size_t num_slots, Index num_ribbons = 1) {
+        Super::Prepare(num_slots, num_ribbons);
 
-        coeffs_ = std::make_unique<CoeffRow[]>(num_slots);
-        results_ = std::make_unique<ResultRow[]>(num_slots);
+        if constexpr (kUseVLR) {
+            // this could be changed to support different values, but that
+            // isn't needed at the moment
+            static_assert(kResultBits == 1);
+            coeffs_ = std::make_unique<CoeffRow[]>(num_slots * Super::num_ribbons_);
+            results_ = std::make_unique<ResultRow[]>((num_slots * Super::num_ribbons_ + result_row_bits - 1) / result_row_bits);
+        } else {
+            coeffs_ = std::make_unique<CoeffRow[]>(num_slots);
+            results_ = std::make_unique<ResultRow[]>(num_slots);
+        }
     }
 
     void Reset() {
@@ -186,33 +250,70 @@ public:
         Super::Reset();
     }
 
-    inline void PrefetchQuery(Index i) const {
-        __builtin_prefetch(&results_[i], /* rw */ 0, /* locality */ 1);
+    inline void PrefetchQuery(Index i, [[maybe_unused]] Index ribbon_idx = 0) const {
+        if constexpr (kUseVLR) {
+            __builtin_prefetch(&results_[(i * Super::num_ribbons_ + ribbon_idx) / result_row_bits], /* rw */ 0, /* locality */ 1);
+        } else {
+            __builtin_prefetch(&results_[i], /* rw */ 0, /* locality */ 1);
+        }
     }
 
-    inline CoeffRow GetCoeffs(Index row) const {
-        return coeffs_[row];
+    inline CoeffRow GetCoeffs(Index row, Index ribbon_idx = 0) const {
+        assert(row < Super::num_slots_);
+        if constexpr (kUseVLR)
+            return coeffs_[row * Super::num_ribbons_ + ribbon_idx];
+        else
+            return coeffs_[row];
     }
-    inline void SetCoeffs(Index row, CoeffRow val) {
-        coeffs_[row] = val;
+    inline void SetCoeffs(Index row, CoeffRow val, Index ribbon_idx = 0) {
+        assert(row < Super::num_slots_);
+        if constexpr (kUseVLR)
+            coeffs_[row * Super::num_ribbons_ + ribbon_idx] = val;
+        else
+            coeffs_[row] = val;
     }
-    inline ResultRow GetResult(Index row) const {
-        return results_[row];
+    inline ResultRow GetResult(Index row, Index ribbon_idx = 0) const {
+        assert(row < Super::num_slots_);
+        if constexpr (kUseVLR) {
+            size_t bit = static_cast<size_t>(row) * Super::num_ribbons_ + ribbon_idx;
+            return (results_[bit / result_row_bits] >> bit % result_row_bits) & 0x1;
+        } else {
+            return results_[row];
+        }
     }
-    inline void SetResult(Index row, ResultRow val) {
-        results_[row] = val;
+    inline void SetResult(Index row, ResultRow val, Index ribbon_idx = 0) {
+        assert(row < Super::num_slots_);
+        if constexpr (kUseVLR) {
+            // TODO: maybe split this up into SetResult and ClearResult to avoid unnecessary operations
+            size_t bit = static_cast<size_t>(row) * Super::num_ribbons_ + ribbon_idx;
+            results_[bit / result_row_bits] &= ~(ResultRow(1) << bit % result_row_bits);
+            results_[bit / result_row_bits] |= val << bit % result_row_bits;
+        } else {
+            results_[row] = val;
+        }
     }
 
     // dummy interface
-    using State = Index;
-    inline State PrepareGetResult(Index row) const {
-        return row;
+    using State = std::conditional_t<kUseVLR, std::pair<Index, size_t>, Index>;
+    inline State PrepareGetResult(Index row, Index ribbon_idx = 0) const {
+        if constexpr (kUseVLR)
+            return std::make_pair(row, ribbon_idx);
+        else
+            return row;
     }
     inline ResultRow GetFromState(const State& state) const {
-        return GetResult(state);
+        if constexpr (kUseVLR)
+            return GetResult(state.first, state.second);
+        else
+            return GetResult(state);
     }
     inline State AdvanceState(State state) const {
-        return state + 1;
+        if constexpr (kUseVLR) {
+            state.first++;
+            return state;
+        } else {
+            return state + 1;
+        }
     }
 
     template <typename Iterator, typename Hasher, typename Callback>
@@ -222,22 +323,31 @@ public:
     }
 
     size_t Size() const {
-        return Super::num_slots_ * sizeof(ResultRow) + Super::Size();
+        if constexpr (kUseVLR)
+            return ((Super::num_slots_ * Super::num_ribbons_ + result_row_bits - 1) / result_row_bits) * sizeof(ResultRow) + Super::Size();
+        else
+            return Super::num_slots_ * Super::num_ribbons_ * sizeof(ResultRow) + Super::Size();
     }
 
     void SerializeIntern(std::ostream &os) const {
         Super::SerializeIntern(os);
-        os.write(reinterpret_cast<const char *>(results_.get()), sizeof(ResultRow) * Super::num_slots_);
+        size_t sz = Super::num_slots_;
+        if constexpr (kUseVLR)
+            sz = (Super::num_slots_ * Super::num_ribbons_ + result_row_bits - 1) / result_row_bits;
+        os.write(reinterpret_cast<const char *>(results_.get()), sizeof(ResultRow) * sz);
     }
 
-    void DeserializeIntern(std::istream &is, bool switchendian) {
-        Super::DeserializeIntern(is, switchendian);
-        results_ = std::make_unique<ResultRow[]>(Super::num_slots_);
-        is.read(reinterpret_cast<char *>(results_.get()), sizeof(ResultRow) * Super::num_slots_);
+    void DeserializeIntern(std::istream &is, bool switchendian, Index num_ribbons) {
+        Super::DeserializeIntern(is, switchendian, num_ribbons);
+        size_t sz = Super::num_slots_;
+        if constexpr (kUseVLR)
+            sz = (Super::num_slots_ * Super::num_ribbons_ + result_row_bits - 1) / result_row_bits;
+        results_ = std::make_unique<ResultRow[]>(sz);
+        is.read(reinterpret_cast<char *>(results_.get()), sizeof(ResultRow) * sz);
         if (switchendian && sizeof(ResultRow) > 1) {
             if (!bswap_type_supported<ResultRow>())
                 throw parse_error("error converting endianness");
-            for (Index i = 0; i < Super::num_slots_; ++i) {
+            for (Index i = 0; i < sz; ++i) {
                 bswap_generic(results_[i]);
             }
         }
@@ -248,6 +358,7 @@ protected:
     std::unique_ptr<ResultRow[]> results_;
 };
 
+// FIXME: document that interleaving for kUseVLR should probably be changed if kResultBits isn't 1
 // only for backsubstition, can't be used for AddRange
 template <typename Config>
 class InterleavedSolutionStorage : public MetaStorage<Config> {
@@ -262,28 +373,48 @@ public:
             Prepare(num_slots);
     }
 
-    void Prepare(size_t num_slots) {
-        Super::Prepare(num_slots);
-        size_t size = GetNumSegments() * sizeof(CoeffRow);
+    void Prepare(size_t num_slots, Index num_ribbons = 1) {
+        Super::Prepare(num_slots, num_ribbons);
+        size_t size;
+        if constexpr (kUseVLR) {
+            size = GetNumSegments() * sizeof(CoeffRow) * num_ribbons;
+        } else {
+            size = GetNumSegments() * sizeof(CoeffRow);
+        }
         data_ = std::make_unique<unsigned char[]>(size);
     }
 
-    void PrefetchQuery(Index segment_num) const {
-        __builtin_prefetch(data_.get() + segment_num * sizeof(CoeffRow),
-                           /* rw */ 0, /* locality */ 1);
+    void PrefetchQuery(Index segment_num, Index ribbon_idx = 0) const {
+        if constexpr (kUseVLR) {
+            __builtin_prefetch(data_.get() + (segment_num * Super::num_ribbons_ + ribbon_idx) * sizeof(CoeffRow),
+                               /* rw */ 0, /* locality */ 1);
+        } else {
+            __builtin_prefetch(data_.get() + segment_num * sizeof(CoeffRow),
+                               /* rw */ 0, /* locality */ 1);
+        }
     }
 
-    inline CoeffRow GetSegment(Index segment_num) const {
+    inline CoeffRow GetSegment(Index segment_num, Index ribbon_idx = 0) const {
         CoeffRow result;
-        memcpy(&result, data_.get() + segment_num * sizeof(CoeffRow),
-               sizeof(CoeffRow));
+        if constexpr (kUseVLR) {
+            memcpy(&result, data_.get() + (segment_num * Super::num_ribbons_ + ribbon_idx) * sizeof(CoeffRow),
+                   sizeof(CoeffRow));
+        } else {
+            memcpy(&result, data_.get() + segment_num * sizeof(CoeffRow),
+                   sizeof(CoeffRow));
+        }
         return result;
         // return *reinterpret_cast<CoeffRow *>(data_.get() +
         //                                    segment_num * sizeof(CoeffRow));
     }
-    inline void SetSegment(Index segment_num, CoeffRow val) {
-        memcpy(data_.get() + segment_num * sizeof(CoeffRow), &val,
-               sizeof(CoeffRow));
+    inline void SetSegment(Index segment_num, CoeffRow val, Index ribbon_idx = 0) {
+        if constexpr (kUseVLR) {
+            memcpy(data_.get() + (segment_num * Super::num_ribbons_ + ribbon_idx) * sizeof(CoeffRow), &val,
+                   sizeof(CoeffRow));
+        } else {
+            memcpy(data_.get() + segment_num * sizeof(CoeffRow), &val,
+                   sizeof(CoeffRow));
+        }
         // *reinterpret_cast<CoeffRow *>(data_.get() +
         //                              segment_num * sizeof(CoeffRow)) = val;
     }
@@ -294,28 +425,32 @@ public:
     // clang-format on
 
     size_t Size() const {
-        return GetNumSegments() * sizeof(CoeffRow) + Super::Size();
+        return GetNumSegments() * Super::num_ribbons_ * sizeof(CoeffRow) + Super::Size();
     };
 
     void SerializeIntern(std::ostream &os) const {
         Super::SerializeIntern(os);
-        size_t size = GetNumSegments() * sizeof(CoeffRow);
+        size_t segments = GetNumSegments() * Super::num_ribbons_;
+        size_t size = segments * sizeof(CoeffRow);
         os.write(reinterpret_cast<const char*>(data_.get()), size);
     }
 
-    void DeserializeIntern(std::istream &is, bool switchendian) {
-        Super::DeserializeIntern(is, switchendian);
-        size_t size = GetNumSegments() * sizeof(CoeffRow);
+    void DeserializeIntern(std::istream &is, bool switchendian, Index num_ribbons = 1) {
+        Super::DeserializeIntern(is, switchendian, num_ribbons);
+        size_t segments = GetNumSegments() * Super::num_ribbons_;
+        size_t size = segments * sizeof(CoeffRow);
         data_ = std::make_unique<unsigned char[]>(size);
         is.read(reinterpret_cast<char*>(data_.get()), size);
         if (switchendian && sizeof(CoeffRow) > 1) {
             if (!bswap_type_supported<CoeffRow>())
                 throw parse_error("error converting endianness");
-            for (Index i = 0; i < GetNumSegments(); ++i) {
+            for (Index i = 0; i < segments; ++i) {
                 // this could probably be made a bit more efficient
-                CoeffRow seg = GetSegment(i);
-                bswap_generic(seg);
-                SetSegment(i, seg);
+                for (Index ribbon_idx = 0; ribbon_idx < Super::num_ribbons_; ribbon_idx++) {
+                    CoeffRow seg = GetSegment(i, ribbon_idx);
+                    bswap_generic(seg);
+                    SetSegment(i, seg, ribbon_idx);
+                }
             }
         }
     }

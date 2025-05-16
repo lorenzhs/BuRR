@@ -10,6 +10,9 @@
 #include <cstdint>
 #include <iomanip>
 #include <utility>
+#include <sstream>
+
+#include <type_traits>
 
 // requires xxhash3, i.e. libxxhash v0.8.0 or later
 // available from https://github.com/Cyan4973/xxHash/releases/tag/v0.8.0
@@ -68,6 +71,7 @@ constexpr unsigned thresh_meta_bits =
 #define IMPORT_RIBBON_CONFIG(RibbonConfig)                                      \
     using CoeffRow = typename RibbonConfig::CoeffRow;                           \
     using ResultRow = typename RibbonConfig::ResultRow;                         \
+    using ResultRowVLR = typename RibbonConfig::ResultRowVLR;                   \
     using Index = typename RibbonConfig::Index;                                 \
     using Hash = typename RibbonConfig::Hash;                                   \
     using Key = typename RibbonConfig::Key;                                     \
@@ -95,14 +99,25 @@ constexpr unsigned thresh_meta_bits =
     [[maybe_unused]] static constexpr bool kUseMHC = RibbonConfig::kUseMHC;     \
     [[maybe_unused]] static constexpr bool kUseMultiplyShiftHash =              \
         RibbonConfig::kUseMultiplyShiftHash;                                    \
+    [[maybe_unused]] static constexpr bool kUseVLR =                            \
+        RibbonConfig::kUseVLR;                                                  \
+    [[maybe_unused]] static constexpr bool kVLRShareMeta =                      \
+        RibbonConfig::kVLRShareMeta;                                            \
+    [[maybe_unused]] static constexpr bool kVLRFlipInputBits =                  \
+        RibbonConfig::kVLRFlipInputBits;                                        \
+    [[maybe_unused]] static constexpr bool kVLRFlipOutputBits =                 \
+        RibbonConfig::kVLRFlipOutputBits;                                       \
                                                                                 \
+    static_assert(!kIsFilter || !kUseVLR);                                      \
+    static_assert(!kUseVLR || kResultBits == 1);                                \
     static_assert(!kUseInterleavedSol || !kUseCacheLineStorage,                 \
                   "can't have both");                                           \
     static_assert(1 << tlx::integer_log2_floor(kBucketSize) == kBucketSize,     \
                   "bucket size must be a power of two");                        \
     static_assert(                                                              \
-        sizeof(CoeffRow) + sizeof(ResultRow) + sizeof(Index) + sizeof(Hash) +   \
-                sizeof(Key) + kBucketSize + kResultBits + kCoeffBits +          \
+        sizeof(CoeffRow) + sizeof(ResultRow) + sizeof(ResultRowVLR) +           \
+                sizeof(Index) + sizeof(Hash) + sizeof(Key) +                    \
+                kBucketSize + kResultBits + kCoeffBits + kUseVLR +              \
                 kFirstCoeffAlwaysOne + (int)kThreshMode + kSparseCoeffs +       \
                 kUseInterleavedSol + kUseCacheLineStorage + kUseMHC +           \
                 kUseMultiplyShiftHash >                                         \
@@ -127,7 +142,7 @@ std::string dump_config() {
 // necessarily make the best choices! Do not use this as is, instead have a look
 // at RConfig and its derivatives below.  This class is mainly useful as it
 // documents the effect of the various settings.
-template <typename CoeffRow_, typename ResultRow_, typename Key_>
+template <typename CoeffRow_, typename ResultRow_, typename Key_, typename ResultRowVLR_ = uint64_t>
 class DefaultConfig {
 public:
     // An unsigned integer type.  The size of this type determines L, the width
@@ -142,6 +157,11 @@ public:
     // The key type.  For retrieval, input consists of pairs of Key and
     // ResultRow, while for filters, it's just Key.
     using Key = Key_;
+    // A type that is big enough to hold the retrieval data that is stored
+    // when using variable length retrieval. When variable length retrieval is
+    // used, kResultBits is always 1 (and ResultRow one byte), but ResultRowVLR
+    // might be a larger type.
+    using ResultRowVLR = ResultRowVLR_;
 
     // An unsigned type that is large enough to hold the maximum index in the
     // input (i.e., input size muts fit into Index).  Use uint64_t if you have
@@ -173,12 +193,13 @@ public:
             return XXH3_64bits_withSeed(reinterpret_cast<const char *>(&key),
                                         sizeof(Key), seed);
         } else {
-            return XXH3_64bits_withSeed(key.data(), key.size(), seed);
+            // size_bytes() works for std::span
+            return XXH3_64bits_withSeed(key.data(), key.size_bytes(), seed);
         }
     }
 
     // Whether the data structure is used as a filter or for retrieval.
-    static constexpr bool kIsFilter = true;
+    static constexpr bool kIsFilter = false;
     // Whether the first coefficient should always be set.  This makes things
     // slightly faster.
     static constexpr bool kFirstCoeffAlwaysOne = true;
@@ -201,9 +222,15 @@ public:
     // Whether to use Master Hash Codes.  This causes keys to be hashed only
     // once during insertion and query, using hash remixing to derive the next
     // level's hash if the key was bumped.  This is almost always a good idea.
-    static constexpr bool kUseMHC = false;
+    static constexpr bool kUseMHC = true;
     // Whether to print timings and other information about the construction.
-    static constexpr bool log = true;
+    static constexpr bool log = false;
+    // Whether to use variable length retrieval
+    static constexpr bool kUseVLR = true;
+    // Whether to use the same metadata for all ribbons when using VLR.
+    static constexpr bool kVLRShareMeta = true;
+    static constexpr bool kVLRFlipInputBits = true;
+    static constexpr bool kVLRFlipOutputBits = true;
 };
 
 namespace {

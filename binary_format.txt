@@ -36,7 +36,11 @@ sizeof(Index) bytes: kBucketSize
 1 byte: kThreshMode
 All in one byte, ordered from least significant to most significant bit:
 kUseMultiplyShiftHash, kIsFilter, kFirstCoeffAlwaysOne,
-kSparseCoeffs, kUseInterleavedSol, kUseMHC
+kSparseCoeffs, kUseInterleavedSol, kUseMHC, kUseVLR, kVLRShareMeta
+
+If kUseVLR is set:
+1 byte: sizeof(ResultRowVLR)
+sizeof(Index) bytes: number of ribbons to use for variable length retrieval
 
 Note that kUseCacheLineStorage is not supported currently.
 
@@ -57,6 +61,9 @@ Solution storage:
 -> interleaved storage: <data size> (calculated from number of slots and
                                     other parameters)
 
+If kUseVLR is set, the metadata and data for all ribbons is stored here (the exact
+structure depends on the storage type).
+
 Hasher:
 -> normal thresholds: nothing
 -> 2 bit thresholds:  sizeof(Index) bytes: lower threshold
@@ -64,3 +71,5 @@ Hasher:
 -> 1+ bit thresholds: sizeof(Index) bytes: threshold
                       sizeof(Index) bytes: size of hash table/buffer
                       2 * sizeof(Index) bytes per hash table/buffer entry
+                      If kUseVLR is set, the table and its size is stored for
+                      each ribbon.

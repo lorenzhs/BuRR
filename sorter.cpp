@@ -15,12 +15,10 @@
 #include <algorithm>
 #include <functional>
 
-template <typename Index, bool IsFilter, bool sparse, typename ResultRow>
-void ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::do_sort(
-    ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::data_t *begin,
-    ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::data_t *end,
+template <typename Index, bool IsFilter, bool sparse, typename data_t>
+void ribbon::Sorter<Index, IsFilter, sparse, data_t>::do_sort(
+    data_t *begin, data_t *end,
     const ribbon::MinimalHasher<Index, sparse> &mh, Index num_starts) {
-    using data_t = ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::data_t;
     auto KeyEx = [&mh, num_starts](const data_t &mhc) -> Index {
         const auto hash = mh.GetHash(mhc);
         const auto start = mh.GetStart(hash, num_starts);
@@ -38,12 +36,20 @@ void ribbon::Sorter<Index, IsFilter, sparse, ResultRow>::do_sort(
 }
 
 // Explicit ips2ra instantiations
-template class ribbon::Sorter<uint32_t, true, false, ribbon::SorterDummyData>;
-template class ribbon::Sorter<uint32_t, false, false, uint8_t>;
-template class ribbon::Sorter<uint32_t, false, false, uint16_t>;
+template class ribbon::Sorter<uint32_t, true, false, uint64_t>;
+template class ribbon::Sorter<uint32_t, false, false, std::pair<uint64_t, uint8_t>>;
+template class ribbon::Sorter<uint32_t, false, false, std::pair<uint64_t, uint16_t>>;
+template class ribbon::Sorter<uint32_t, false, false, std::pair<uint64_t, uint32_t>>;
+template class ribbon::Sorter<uint32_t, false, false, std::pair<uint64_t, uint64_t>>;
+
+// VLR MHC instantiations
+template class ribbon::Sorter<uint32_t, false, false, std::tuple<uint64_t, uint8_t, uint8_t>>;
+template class ribbon::Sorter<uint32_t, false, false, std::tuple<uint64_t, uint16_t, uint16_t>>;
+template class ribbon::Sorter<uint32_t, false, false, std::tuple<uint64_t, uint32_t, uint32_t>>;
+template class ribbon::Sorter<uint32_t, false, false, std::tuple<uint64_t, uint64_t, uint64_t>>;
 
 // sparse configs - filter only for now
-template class ribbon::Sorter<uint32_t, true, true, ribbon::SorterDummyData>;
+template class ribbon::Sorter<uint32_t, true, true, uint64_t>;
 /*
 template class ribbon::Sorter<uint32_t, false, true, uint8_t>;
 template class ribbon::Sorter<uint32_t, false, true, uint16_t>;

@@ -23,7 +23,7 @@
 namespace ribbon {
 
 template <typename BandingStorage, typename SolutionStorage>
-void SimpleBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
+void SimpleBackSubst(const BandingStorage &bs, SolutionStorage *sol, typename BandingStorage::Index num_ribbons = 1) {
     using CoeffRow = typename BandingStorage::CoeffRow;
     using Index = typename BandingStorage::Index;
     // use uint32_t instead of uint16_t because gcc is bad with uint16_t
@@ -31,13 +31,18 @@ void SimpleBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
 
     constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U);
     constexpr auto kResultBits = static_cast<Index>(sizeof(ResultRow) * 8U);
+    constexpr bool kUseVLR = BandingStorage::kUseVLR;
 
 
     // A column-major buffer of the solution matrix, containing enough
     // recently-computed solution data to compute the next solution row
     // (based also on banding data).
-    std::array<CoeffRow, kResultBits> state;
-    state.fill(0);
+    std::conditional_t<kUseVLR, std::unique_ptr<CoeffRow[]>, std::array<CoeffRow, kResultBits>> state;
+    if constexpr (kUseVLR) {
+        state = std::make_unique<CoeffRow[]>(kResultBits * num_ribbons);
+    } else {
+        state.fill(0);
+    }
 
     const Index num_starts = bs.GetNumStarts();
     // sss->PrepareForNumStarts(num_starts);
@@ -45,31 +50,49 @@ void SimpleBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
 
     for (Index i = num_slots; i > 0;) {
         --i;
-        CoeffRow cr = bs.GetCoeffs(i);
-        ResultRow rr = bs.GetResult(i);
-        // solution row
-        ResultRow sr = 0;
-        for (Index j = 0; j < kResultBits; ++j) {
-            // Compute next solution bit at row i, column j (see derivation below)
-            CoeffRow tmp = state[j] << 1;
-            bool bit = (rocksdb::BitParity(tmp & cr) ^ ((rr >> j) & 1)) != 0;
-            tmp |= bit ? CoeffRow{1} : CoeffRow{0};
+        if constexpr (kUseVLR) {
+            for (Index r = 0; r < num_ribbons; ++r) {
+                // see !kUseVLR version for comments
+                CoeffRow cr = bs.GetCoeffs(i, r);
+                ResultRow rr = bs.GetResult(i, r);
+                ResultRow sr = 0;
+                for (Index j = 0; j < kResultBits; ++j) {
+                    CoeffRow tmp = state[r * kResultBits + j] << 1;
+                    bool bit = (rocksdb::BitParity(tmp & cr) ^ ((rr >> j) & 1)) != 0;
+                    tmp |= bit ? CoeffRow{1} : CoeffRow{0};
+                    state[r * kResultBits + j] = tmp;
+                    sr |= (bit ? ResultRow{1} : ResultRow{0}) << j;
+                }
+                sol->SetResult(i, sr, r);
+            }
+        } else {
+            CoeffRow cr = bs.GetCoeffs(i);
+            ResultRow rr = bs.GetResult(i);
+            // solution row
+            ResultRow sr = 0;
+            for (Index j = 0; j < kResultBits; ++j) {
+                // Compute next solution bit at row i, column j (see derivation below)
+                CoeffRow tmp = state[j] << 1;
+                bool bit = (rocksdb::BitParity(tmp & cr) ^ ((rr >> j) & 1)) != 0;
+                tmp |= bit ? CoeffRow{1} : CoeffRow{0};
 
-            // Now tmp is solution at column j from row i for next kCoeffBits
-            // more rows. Thus, for valid solution, the dot product of the
-            // solution column with the coefficient row has to equal the result
-            // at that column,
-            //   BitParity(tmp & cr) == ((rr >> j) & 1)
+                // Now tmp is solution at column j from row i for next kCoeffBits
+                // more rows. Thus, for valid solution, the dot product of the
+                // solution column with the coefficient row has to equal the result
+                // at that column,
+                //   BitParity(tmp & cr) == ((rr >> j) & 1)
 
-            // Update state.
-            state[j] = tmp;
-            // add to solution row
-            sr |= (bit ? ResultRow{1} : ResultRow{0}) << j;
+                // Update state.
+                state[j] = tmp;
+                // add to solution row
+                sr |= (bit ? ResultRow{1} : ResultRow{0}) << j;
+            }
+            sol->SetResult(i, sr);
         }
-        sol->SetResult(i, sr);
     }
 
 #ifdef RIBBON_DUMP
+    // FIXME: This doesn't output all information if VLR is enabled.
     sLOG1 << num_slots << "slots";
     for (Index i = 0; i < num_slots; i++) {
         const ResultRow r = sol->GetResult(i);
@@ -80,12 +103,14 @@ void SimpleBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
 #endif
 }
 
+// FIXME: check if this function is inlined and ribbon_idx optimized out if VLR is not enabled
 // A helper for InterleavedBackSubst.
 template <typename BandingStorage>
 inline void BackSubstBlock(typename BandingStorage::CoeffRow *state,
                            typename BandingStorage::Index num_columns,
                            const BandingStorage &bs,
-                           typename BandingStorage::Index start_slot) {
+                           typename BandingStorage::Index start_slot,
+                           typename BandingStorage::Index ribbon_idx = 0) {
     using CoeffRow = typename BandingStorage::CoeffRow;
     using Index = typename BandingStorage::Index;
     using ResultRow = typename BandingStorage::ResultRow;
@@ -94,8 +119,15 @@ inline void BackSubstBlock(typename BandingStorage::CoeffRow *state,
 
     for (Index i = start_slot + kCoeffBits; i > start_slot;) {
         --i;
-        CoeffRow cr = bs.GetCoeffs(i);
-        ResultRow rr = bs.GetResult(i);
+        CoeffRow cr;
+        ResultRow rr;
+        if constexpr (BandingStorage::kUseVLR) {
+            cr = bs.GetCoeffs(i, ribbon_idx);
+            rr = bs.GetResult(i, ribbon_idx);
+        } else {
+            cr = bs.GetCoeffs(i);
+            rr = bs.GetResult(i);
+        }
         for (Index j = 0; j < num_columns; ++j) {
             // Compute next solution bit at row i, column j (see derivation below)
             CoeffRow tmp = state[j] << 1;
@@ -114,10 +146,12 @@ inline void BackSubstBlock(typename BandingStorage::CoeffRow *state,
     }
 }
 
+// num_ribbons is only used when kUseVLR is set
 template <typename BandingStorage, typename SolutionStorage>
-void InterleavedBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
+void InterleavedBackSubst(const BandingStorage &bs, SolutionStorage *sol, typename BandingStorage::Index num_ribbons = 1) {
     using CoeffRow = typename BandingStorage::CoeffRow;
     using Index = typename BandingStorage::Index;
+    constexpr bool kUseVLR = BandingStorage::kUseVLR;
 
     static_assert(sizeof(Index) == sizeof(typename SolutionStorage::Index),
                   "must be same");
@@ -131,7 +165,10 @@ void InterleavedBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
     const Index num_slots = bs.GetNumSlots();
     // num_slots *MUST* be a multiple of kCoeffBits
     assert(num_slots >= kCoeffBits && num_slots % kCoeffBits == 0);
-    sol->Prepare(num_slots);
+    if constexpr (kUseVLR)
+        sol->Prepare(num_slots, num_ribbons);
+    else
+        sol->Prepare(num_slots);
 
     const Index num_blocks = sol->GetNumBlocks();
     const Index num_segments = sol->GetNumSegments();
@@ -147,17 +184,31 @@ void InterleavedBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
     // A column-major buffer of the solution matrix, containing enough
     // recently-computed solution data to compute the next solution row
     // (based also on banding data).
-    std::unique_ptr<CoeffRow[]> state{new CoeffRow[kResultBits]()};
+    std::unique_ptr<CoeffRow[]> state{new CoeffRow[kResultBits * num_ribbons]()};
 
+    // NOTE: When VLR is enabled, kResultBits should be 1 anyways, but this is still
+    // implemented in such a way that it could technically also be a different value.
     Index block = num_blocks;
     Index segment = num_segments;
     while (block > 0) {
         --block;
         sLOG << "Backsubstituting block" << block << "segment" << segment;
-        BackSubstBlock(state.get(), kResultBits, bs, block * kCoeffBits);
+        if constexpr (kUseVLR) {
+            for (Index r = 0; r < num_ribbons; ++r) {
+                BackSubstBlock(state.get() + r * kResultBits, kResultBits, bs, block * kCoeffBits, r);
+            }
+        } else {
+            BackSubstBlock(state.get(), kResultBits, bs, block * kCoeffBits);
+        }
         segment -= kResultBits;
         for (Index i = 0; i < kResultBits; ++i) {
-            sol->SetSegment(segment + i, state[i]);
+            if constexpr (kUseVLR) {
+                for (Index r = 0; r < num_ribbons; ++r) {
+                    sol->SetSegment(segment + i, state[r * kResultBits + i], r);
+                }
+            } else {
+                sol->SetSegment(segment + i, state[i]);
+            }
         }
     }
     // Verify everything processed
@@ -166,6 +217,7 @@ void InterleavedBackSubst(const BandingStorage &bs, SolutionStorage *sol) {
 
 
 #ifdef RIBBON_DUMP
+    // FIXME: This currently doesn't output all information when VLR is enabled.
     sLOG1 << sol->GetNumSegments() << "segments in" << sol->GetNumBlocks()
           << "blocks";
     for (Index i = 0; i < sol->GetNumSegments(); i++) {

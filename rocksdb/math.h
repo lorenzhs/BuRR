@@ -57,6 +57,53 @@ inline int CountTrailingZeroBits(T v) {
 #endif
 }
 
+// this is not taken from rocksdb, but based on CountTrailingZeroBits
+// Note: this has only been tested on gcc and clang
+// Number of high-order zero bits before the first 1 bit. Undefined for 0.
+template <typename T>
+inline int CountLeadingZeroBits(T v) {
+    static_assert(std::is_integral<T>::value || std::is_same_v<T, __uint128_t>,
+                  "non-integral type");
+    assert(v != 0);
+    constexpr unsigned int num_bits = sizeof(v) * 8U;
+#ifdef _MSC_VER
+    static_assert(sizeof(T) <= sizeof(uint64_t), "type too big");
+    unsigned long tz = 0;
+    if (sizeof(T) <= sizeof(uint32_t)) {
+        _BitScanReverse(&tz, static_cast<uint32_t>(v));
+        tz = num_bits - tz - 1;
+    } else {
+#if defined(_M_X64) || defined(_M_ARM64)
+        _BitScanReverse64(&tz, static_cast<uint64_t>(v));
+        tz = num_bits - tz - 1;
+#else
+        uint32_t upper = static_cast<uint32_t>(static_cast<uint64_t>(v) >> 32);
+        if (upper) {
+            _BitScanReverse(&tz, upper);
+            tz = num_bits - tz - 33;
+        } else {
+            _BitScanReverse(&tz, static_cast<uint32_t>(v));
+            tz = num_bits - tz - 1;
+        }
+#endif
+    }
+    return static_cast<int>(tz);
+#else
+    if constexpr (sizeof(T) <= sizeof(unsigned int)) {
+        return __builtin_clz(static_cast<unsigned int>(v)) - (sizeof(unsigned int) * 8U - num_bits);
+    } else if constexpr (sizeof(T) <= sizeof(unsigned long)) {
+        return __builtin_clzl(static_cast<unsigned long>(v)) - (sizeof(unsigned long) * 8U - num_bits);
+    } else if constexpr (sizeof(T) <= sizeof(unsigned long long)) {
+        return __builtin_clzll(static_cast<unsigned long long>(v)) - (sizeof(unsigned long long) * 8U - num_bits);
+    } else if constexpr (sizeof(T) == 16) {
+        const uint64_t upper = static_cast<uint64_t>(v >> 64);
+        return upper ? CountLeadingZeroBits(upper) : CountLeadingZeroBits(static_cast<uint64_t>(v)) + 64;
+    } else {
+        static_assert(sizeof(T) <= 16, "type too big");
+    }
+#endif
+}
+
 template <typename T>
 inline int BitParity(T v) {
     static_assert(std::is_integral<T>::value || std::is_same_v<T, __uint128_t>,

@@ -1,0 +1,56 @@
+Consider the insertion of the value 1010 (binary) into a VLR data structure
+with 5 ribbons, with ResultRowVLR being 8 bits.
+
+The value given to AddRange must then be 00011010. The extra 1 has to be added
+so BuRR can determine where the actual value starts. This also means that
+ResultRowVLR must always be able to hold one more bit than the maximum value
+that will be inserted. Note also that values cannot contain more bits than
+there are ribbons in the data structure.
+
+Internally, the key belonging to the value will be mapped to a start position
+in the list of ribbons. For this example, assume the (zero-indexed) start position
+is 1. Then the bits in the value will be mapped to the positions 1-4. This is where
+the configuration parameter kVLRFlipInputBits comes into play. If the parameter
+is false, the values will be mapped to the ribbons as follows: X 1 0 1 0
+(where the X denotes the first/0th ribbon, which nothing is mapped to). If the
+parameter is true, they will be mapped as follows: X 0 1 0 1.
+
+The queries also support a similar parameter, kVLRFlipOutputBits. If this
+parameter is false, the bits are returned in the order that they are stored in
+the ribbons. If, as in the example with kVLRFlipInputBits = false, the stored
+bits in the ribbons are X 1 0 1 0, the return value will be 1010XXXX, where X
+can be anything since BuRR only knows where the valid bits start, not where
+they stop (in this particular case, however, only the first X after the last
+valid bit will actually be read from a ribbon since there are only 5 ribbons,
+so BuRR knows that there can only be 5 valid bits).
+
+If kVLRFlipOutputBits is true, and the stored bits in the ribbons are still
+X 1 0 1 0, the output will instead be XXXX0101.
+
+This leads to the following possible outputs, all with the input being 00011010:
+
+kVLRFlipInputBits = false, kVLRFlipOutputBits = false: 1010XXXX
+kVLRFlipInputBits = false, kVLRFlipOutputBits = true: XXXX0101
+kVLRFlipInputBits = true, kVLRFlipOutputBits = false: 0101XXXX
+kVLRFlipInputBits = true, kVLRFlipOutputBits = true: XXXX1010
+
+Note that VLR-BuRR also offers an optional query interface that allows specifying
+the specific bits to query (QueryRetrieval(key, start_idx, num_bits)). The start
+index given to this interface always counts from the side of the output on which
+the valid bits start. In the same example as before, a query with start_idx = 1
+and num_bits = 2 would return the following values (technically, the X's in this
+case would be zeroes since they aren't retrieved from any ribbons, but this
+representation makes it easier to see which bits were retrieved):
+
+kVLRFlipInputBits = false, kVLRFlipOutputBits = false: X01XXXXX
+kVLRFlipInputBits = false, kVLRFlipOutputBits = true: XXXXX10X
+kVLRFlipInputBits = true, kVLRFlipOutputBits = false: X10XXXXX
+kVLRFlipInputBits = true, kVLRFlipOutputBits = true: XXXXX01X
+
+When kVLRShareMeta is false, there is another query interface that directly
+takes a bitmask where the bits that should be queried are set to 1:
+QueryRetrieval(const Key &key, ResultRowVLR mask)
+
+The mask in this interface directly maps to the output, i.e. it is equivalent
+to running a regular query and then masking the result with the mask, except
+that it is faster because only the needed bits are retrieved.

@@ -1,3 +1,5 @@
+*.swp
+
 parbench
 parbench_*
 pb_*
@@ -10,7 +12,8 @@ bench_*
 b_*
 tests
 ribbon
-ribbon_*
+ribbon_vlr
+ribbon_huffman
 debug
 debug_*
 perf.data*
@@ -127,3 +130,5 @@ flycheck_*.el
 .nfs*
 
 # End of https://www.toptal.com/developers/gitignore/api/c++,emacs,linux
+
+build

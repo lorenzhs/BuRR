@@ -9,6 +9,7 @@
 #include <bits/stdint-uintn.h>
 
 #include <utility>
+#include <tuple>
 
 namespace ribbon {
 
@@ -30,6 +31,11 @@ public:
     template <typename ResultRow>
     inline hash_t GetHash(const std::pair<mhc_t, ResultRow> &p) const {
         return GetHash(p.first);
+    }
+    template <typename ResultRowVLR>
+    // This is needed for the VLR MHC case when the bump mask is stored together with the input.
+    inline hash_t GetHash(const std::tuple<mhc_t, ResultRowVLR, ResultRowVLR>& p) const {
+        return GetHash(std::get<0>(p));
     }
 
     inline Index GetStart(hash_t h, Index num_starts) const {
