@@ -13,6 +13,14 @@
 
 // requires xxhash3, i.e. libxxhash v0.8.0 or later
 // available from https://github.com/Cyan4973/xxHash/releases/tag/v0.8.0
+//
+// On gcc, xxhash defaults to mode 1, whose XXH_read32/XXH_read64 read through
+// typedefs lacking __may_alias__, so TBAA lets gcc delete stores to the values
+// we hash and every item then gets item 0's hash.
+// https://github.com/Cyan4973/xxHash/issues/1126
+#ifndef XXH_FORCE_MEMORY_ACCESS
+#define XXH_FORCE_MEMORY_ACCESS 0
+#endif
 #define XXH_INLINE_ALL
 #include <xxhash.h>
 
