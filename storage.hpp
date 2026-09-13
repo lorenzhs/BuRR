@@ -9,6 +9,7 @@
 #include "serialization.hpp"
 
 #include <cassert>
+#include <cstring>
 #include <memory>
 #include <ostream>
 #include <istream>
@@ -99,10 +100,11 @@ public:
             Index fetch_bucket = start_bit / meta_t_bits;
             // start_bit now indicates which bits of 'fetch' we need
             start_bit -= fetch_bucket * meta_t_bits;
-            fetch_t* fetch =
-                reinterpret_cast<fetch_t*>(meta_.get() + fetch_bucket);
-            *fetch &= ~(extractor_mask << start_bit);
-            *fetch |= (val << start_bit);
+            fetch_t fetch;
+            memcpy(&fetch, meta_.get() + fetch_bucket, sizeof(fetch_t));
+            fetch &= ~(extractor_mask << start_bit);
+            fetch |= (val << start_bit);
+            memcpy(meta_.get() + fetch_bucket, &fetch, sizeof(fetch_t));
         }
         assert(GetMeta(bucket) == val);
     }
@@ -428,10 +430,10 @@ public:
         const Index mapped_bucket =
             (bucket * (clbits / kResultBits)) / items_per_cl;
         const Index cl = mapped_bucket / buckets_per_cl, idx = cl * clsize;
-        meta_t* ptr = reinterpret_cast<meta_t*>(data_.get() + idx);
 
         if constexpr (kThreshMode == ThreshMode::normal && buckets_per_cl == 1) {
-            *ptr = val;
+            const meta_t meta_block = val;
+            memcpy(data_.get() + idx, &meta_block, sizeof(meta_t));
         } else {
             const auto shift =
                 meta_bits_per_bucket * (mapped_bucket & (buckets_per_cl - 1));
@@ -439,9 +441,12 @@ public:
             assert(val <= mask);
             sLOG << "SetMeta" << bucket << "val" << (int)val << "-> cl" << cl
                  << "idx" << idx << "shift" << shift << "mask" << mask;
+            meta_t meta_block;
+            memcpy(&meta_block, data_.get() + idx, sizeof(meta_t));
             // first clear, then write
-            *ptr &= ~static_cast<meta_t>(mask << shift);
-            *ptr |= (static_cast<meta_t>(val) << shift);
+            meta_block &= ~static_cast<meta_t>(mask << shift);
+            meta_block |= (static_cast<meta_t>(val) << shift);
+            memcpy(data_.get() + idx, &meta_block, sizeof(meta_t));
         }
         assert(GetMeta(bucket) == val);
     }
@@ -535,9 +540,11 @@ public:
              << offset << "in row" << data_row;
 
         const auto shift = (row_in_cl % items_per_row) * kResultBits;
-        ResultRow* ptr = reinterpret_cast<ResultRow*>(data_.get() + data_row);
-        *ptr &= ~static_cast<ResultRow>(maxval << shift);
-        *ptr |= (val << shift);
+        ResultRow result;
+        memcpy(&result, data_.get() + data_row, sizeof(ResultRow));
+        result &= ~static_cast<ResultRow>(maxval << shift);
+        result |= (val << shift);
+        memcpy(data_.get() + data_row, &result, sizeof(ResultRow));
     }
 
     // clang-format off
